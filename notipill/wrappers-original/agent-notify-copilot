@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# GitHub Copilot CLI hook → notify-send (mako)
+# Reads hook JSON on stdin. Argv[1] is the event name.
+set -u
+event="${1:-unknown}"
+payload="$(cat)"
+
+cwd="$(printf '%s' "$payload" | jq -r '.cwd // ""' 2>/dev/null)"
+project="${cwd##*/}"
+project="${project:-copilot}"
+
+case "$event" in
+  notification)
+    msg="$(printf '%s' "$payload" | jq -r '.message // "Copilot needs your attention"' 2>/dev/null)"
+    notify-send -a Copilot -u critical -i utilities-terminal "Copilot • $project" "$msg" >/dev/null 2>&1
+    ;;
+  permissionRequest)
+    tool="$(printf '%s' "$payload" | jq -r '.tool_name // .tool // "permission requested"' 2>/dev/null)"
+    notify-send -a Copilot -u critical -i utilities-terminal "Copilot • $project" "Permission: $tool" >/dev/null 2>&1
+    ;;
+  agentStop)
+    notify-send -a Copilot -u normal -i utilities-terminal "Copilot done • $project" "Turn finished" >/dev/null 2>&1
+    ;;
+  *)
+    notify-send -a Copilot -u low -i utilities-terminal "Copilot" "Unknown hook event: $event" >/dev/null 2>&1
+    ;;
+esac
+
+# Empty JSON object — no decision, no override
+printf '{}'

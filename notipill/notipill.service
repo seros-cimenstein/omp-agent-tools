@@ -1,0 +1,12 @@
+[Unit]
+Description=Notipill notification daemon
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/lib/notipill/notipill.py daemon
+Restart=on-failure
+RestartSec=3
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

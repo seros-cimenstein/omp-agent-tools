@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Claude Code hook -> notipill, falling back to notify-send (mako)
+# Reads hook JSON on stdin. Argv[1] is the event name.
+set -u
+event="${1:-unknown}"
+payload="$(cat)"
+
+cwd="$(printf '%s' "$payload" | jq -r '.cwd // ""' 2>/dev/null)"
+project="${cwd##*/}"
+project="${project:-claude}"
+
+case "$event" in
+  Notification)
+    msg="$(printf '%s' "$payload" | jq -r '.message // "Claude needs your attention"' 2>/dev/null)"
+    if ! "$HOME/.local/bin/notipill" send --source claude --kind attention --title "Claude · $project" --body "$msg" >/dev/null 2>&1; then
+      notify-send -a Claude -u critical -i utilities-terminal "Claude • $project" "$msg"
+    fi
+    ;;
+  Stop)
+    if ! "$HOME/.local/bin/notipill" send --source claude --kind done --title "Claude · $project" --body "turn finished" >/dev/null 2>&1; then
+      notify-send -a Claude -u normal -i utilities-terminal "Claude done • $project" "Turn finished"
+    fi
+    ;;
+  *)
+    if ! "$HOME/.local/bin/notipill" send --source claude --kind info --title "Claude · $project" --body "Unknown hook event: $event" >/dev/null 2>&1; then
+      notify-send -a Claude -u low -i utilities-terminal "Claude" "Unknown hook event: $event"
+    fi
+    ;;
+esac
