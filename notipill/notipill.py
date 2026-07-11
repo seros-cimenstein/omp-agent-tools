@@ -43,7 +43,17 @@ DOT_COLORS = {
     "error": "#ff4444",
     "info": "#999999",
 }
-MAX_PILL_WIDTH = 420
+MAX_PILL_WIDTH = 560
+DEFAULT_TITLE_SIZE = 14
+DEFAULT_BODY_SIZE = 12
+DOT_SIZE = 14
+LEFT_PAD = 14
+TEXT_GAP = 11
+RIGHT_PAD = 17
+TOP_PAD = 7
+BOTTOM_PAD = 7
+MIN_SINGLE_ROW_HEIGHT = 34
+MIN_DOUBLE_ROW_HEIGHT = 60
 ELLIPSIS = "…"
 
 
@@ -62,6 +72,8 @@ class Config:
     margin: int
     max_pills: int
     timeouts: dict[str, float]
+    title_size: int
+    body_size: int
 
 
 @dataclass(frozen=True)
@@ -124,12 +136,14 @@ def load_config(path: Path) -> Config:
     margin = 10
     max_pills = 5
     timeouts = dict(DEFAULT_TIMEOUTS)
+    title_size = DEFAULT_TITLE_SIZE
+    body_size = DEFAULT_BODY_SIZE
 
     try:
         with path.open("r", encoding="utf-8") as config_file:
             raw = json.load(config_file)
     except FileNotFoundError:
-        return Config(margin, max_pills, timeouts)
+        return Config(margin, max_pills, timeouts, title_size, body_size)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid JSON in {path}: {exc}") from exc
     except OSError as exc:
@@ -142,6 +156,10 @@ def load_config(path: Path) -> Config:
         margin = coerce_nonnegative_int(raw["margin"], "margin")
     if "max_pills" in raw:
         max_pills = coerce_positive_int(raw["max_pills"], "max_pills")
+    if "title_size" in raw:
+        title_size = coerce_positive_int(raw["title_size"], "title_size")
+    if "body_size" in raw:
+        body_size = coerce_positive_int(raw["body_size"], "body_size")
     if "timeouts" in raw:
         raw_timeouts = raw["timeouts"]
         if not isinstance(raw_timeouts, dict):
@@ -151,7 +169,7 @@ def load_config(path: Path) -> Config:
                 raise ConfigError(f"unknown timeout kind: {kind!r}")
             timeouts[kind] = coerce_timeout(value, f"timeouts.{kind}")
 
-    return Config(margin, max_pills, timeouts)
+    return Config(margin, max_pills, timeouts, title_size, body_size)
 
 
 def parse_notification(data: bytes) -> Notification:
@@ -254,9 +272,9 @@ class NotificationApp:
 
         self.root.withdraw()
         self.title_font = tkfont.nametofont("TkDefaultFont").copy()
-        self.title_font.configure(size=10)
+        self.title_font.configure(size=config.title_size, weight="bold")
         self.body_font = tkfont.nametofont("TkDefaultFont").copy()
-        self.body_font.configure(size=9)
+        self.body_font.configure(size=config.body_size)
 
         self.panel = tk.Toplevel(self.root)
         self.panel.withdraw()
@@ -426,25 +444,19 @@ class NotificationApp:
 
     def measure_row(self, active: ActiveNotification) -> RowMetrics:
         notification = active.notification
-        dot_size = 10
-        left_pad = 10
-        text_gap = 8
-        right_pad = 12
-        top_pad = 5
-        bottom_pad = 5
-        text_left = left_pad + dot_size + text_gap
+        text_left = LEFT_PAD + DOT_SIZE + TEXT_GAP
         has_body = bool(notification.body)
         title_line = self.title_font.metrics("linespace")
         body_line = self.body_font.metrics("linespace") if has_body else 0
         if has_body:
-            height = max(40, top_pad + title_line + body_line + bottom_pad)
+            height = max(MIN_DOUBLE_ROW_HEIGHT, TOP_PAD + title_line + body_line + BOTTOM_PAD)
         else:
-            height = max(24, title_line + top_pad + bottom_pad)
+            height = max(MIN_SINGLE_ROW_HEIGHT, title_line + TOP_PAD + BOTTOM_PAD)
 
         text_width = self.title_font.measure(notification.title)
         if has_body:
             text_width = max(text_width, self.body_font.measure(notification.body))
-        natural_width = max(height, text_left + text_width + right_pad)
+        natural_width = max(height, text_left + text_width + RIGHT_PAD)
         return RowMetrics(active, height, natural_width)
 
     def draw_panel_background(self, width: int, height: int) -> None:
@@ -506,13 +518,8 @@ class NotificationApp:
         row_height: int,
     ) -> None:
         notification = active.notification
-        dot_size = 10
-        left_pad = 10
-        text_gap = 8
-        right_pad = 12
-        top_pad = 5
-        text_left = left_pad + dot_size + text_gap
-        text_max = width - text_left - right_pad
+        text_left = LEFT_PAD + DOT_SIZE + TEXT_GAP
+        text_max = width - text_left - RIGHT_PAD
         title = ellipsize(notification.title, self.title_font, text_max)
         has_body = bool(notification.body)
         body = ""
@@ -520,13 +527,13 @@ class NotificationApp:
             body = ellipsize(notification.body, self.body_font, text_max)
 
         tag = f"n{active.id}"
-        dot_y = row_top + (row_height - dot_size) / 2
-        dot_x = left_pad
+        dot_y = row_top + (row_height - DOT_SIZE) / 2
+        dot_x = LEFT_PAD
         self.canvas.create_oval(
             dot_x,
             dot_y,
-            dot_x + dot_size,
-            dot_y + dot_size,
+            dot_x + DOT_SIZE,
+            dot_y + DOT_SIZE,
             fill=DOT_COLORS[notification.kind],
             outline="",
             tags=(tag,),
@@ -536,7 +543,7 @@ class NotificationApp:
         if has_body:
             self.canvas.create_text(
                 text_left,
-                row_top + top_pad,
+                row_top + TOP_PAD,
                 anchor="nw",
                 text=title,
                 fill=TITLE_FG,
@@ -545,7 +552,7 @@ class NotificationApp:
             )
             self.canvas.create_text(
                 text_left,
-                row_top + top_pad + title_line - 1,
+                row_top + TOP_PAD + title_line - 1,
                 anchor="nw",
                 text=body,
                 fill=BODY_FG,
