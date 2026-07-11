@@ -279,6 +279,10 @@ class NotificationApp:
         self.panel = tk.Toplevel(self.root)
         self.panel.withdraw()
         self.panel.overrideredirect(True)
+        try:
+            self.panel.attributes("-type", "notification")
+        except tk.TclError:
+            pass
         self.panel.attributes("-topmost", True)
         self.panel.configure(bg=TRANSPARENT_BG)
 
