@@ -1,0 +1,80 @@
+# seref_loop
+
+A way to make omp's `/loop` run until a whole list of work is *really* finished, and to let the
+agent declare it finished in a way a shell check can trust.
+
+It came out of the bist_bot audit (2026-10-17). That audit produced 26 findings to fix, too many
+for one session. The fix: a checklist file that serves as the loop's memory, plus a gate command
+that `/loop --until` runs before each iteration.
+
+## How it works
+
+```mermaid
+flowchart TD
+  A["/seref_loop goal"] --> B["Verify findings yourself<br/>(code, live data, scouts)"]
+  B --> C["LOOP_SLUG.md ledger<br/>protocol + atomic items"]
+  C --> D["gate must exit 1"]
+  D --> E["user pastes the /loop line"]
+  E --> F["iteration: first '- [ ]' item<br/>fix, test, smoke, deploy, tick with evidence"]
+  F --> G{"seref-loop-gate"}
+  G -->|"1: open or premature DONE"| F
+  G -->|"0: STATUS: DONE, all proven"| H["loop stops"]
+  G -->|"2: ledger broken"| I["loop stops with error"]
+```
+
+1. **Setup (`/seref_loop [goal | findings file]`)**, one turn, no fixing yet:
+   - The agent checks every claim against the code and the live hosts itself, drops or
+     downgrades the ones that don't hold, and adds what it finds on its own.
+   - It writes `LOOP_<SLUG>.md` at the repo root from `templates/LEDGER.md`: a project-specific
+     protocol (tests, smoke hosts, deploy windows, backups, commit policy) and one line per atomic
+     item with file:line, evidence, fix direction and an acceptance check.
+   - It runs the gate (it must exit 1) and replies with the exact `/loop` line to paste, plus the
+     default decisions it made, so you can veto them first.
+2. **Run (`/loop N --until '…/seref-loop-gate LOOP_<SLUG>.md' <iteration prompt>`)**:
+   - Each iteration takes the first `- [ ]`, re-checks it, fixes it, verifies it, and marks it
+     `- [x] … — DONE: <evidence>`. Wrong findings become `INVALID:`. Real blockers become
+     `- [!] … — BLOCKED: <reason>`.
+   - When nothing is open, the agent runs every suite and writes `STATUS: DONE`. That is how it
+     claims done.
+   - `N` caps the iterations as a backstop. Esc pauses; `/loop` again turns it off.
+
+## The gate (`bin/seref-loop-gate [LEDGER]`)
+
+`/loop --until` stops on exit 0, runs again on 1, and stops with an error on anything else.
+
+| Ledger state | Exit | Loop |
+|---|---|---|
+| `- [ ]` items left | 1 | next iteration |
+| `STATUS: DONE` but an item is open, a `[x]` lacks `DONE:`/`INVALID:`, or a `[!]` lacks `BLOCKED:` | 1 | next iteration (the claim is rejected) |
+| `STATUS: DONE`, every item `[x]` with evidence or `[!]` with a reason | 0 | stops: done |
+| No ledger, no `STATUS:` line, unknown status, no items, an unfilled `{{PLACEHOLDER}}` | 2 | stops, shows the reason |
+
+The gate prints a one-line summary to stderr, e.g. `OPEN: 3 done, 0 blocked, 23 open of 26`.
+
+## Files
+
+| Path | What |
+|---|---|
+| `commands/seref_loop.md` | the `/seref_loop` slash command (the setup methodology the agent follows) |
+| `templates/LEDGER.md` | ledger skeleton: STATUS line, per-iteration protocol, item format |
+| `bin/seref-loop-gate` | the stop condition for `/loop --until` |
+| `tests/test_gate.sh` | contract test for the gate's exit codes |
+| `install.sh` | links the command into `~/.omp/agent/commands/` (or `$PI_CODING_AGENT_DIR/commands`) |
+
+## Install / test
+
+```bash
+./install.sh          # then restart omp (or /reload-plugins) to pick up /seref_loop
+./tests/test_gate.sh
+```
+
+The command is a symlink, so edits here apply on the next omp start. It goes through omp's
+Handlebars rendering, so keep `{{` out of `commands/seref_loop.md`; the template's placeholders
+live in `templates/LEDGER.md`, which is copied, not rendered.
+
+## Tips
+
+- For more than ~15 items, set `loop.mode` to `compact` or `reset` in omp's settings. The
+  ledger carries all state, so a fresh context each iteration is safe and stays fast.
+- One ledger per goal. Keep it at the repo root next to the code it fixes; delete it after the
+  loop ends (the gate treats a missing ledger as an error, so not while it runs).

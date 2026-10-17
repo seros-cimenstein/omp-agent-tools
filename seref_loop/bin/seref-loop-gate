@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Stop condition for omp's `/loop --until '<cmd>'`, read from a seref_loop ledger.
+#
+# Usage: seref-loop-gate [LEDGER]          (default: LOOP_LEDGER.md in the current directory)
+#
+# Exit status (what /loop does with it):
+#   0  done: `STATUS: DONE`, no `- [ ]` item left, every `- [x]` carries DONE:/INVALID:
+#      evidence and every `- [!]` a BLOCKED: reason            -> loop stops ("satisfied")
+#   1  not done yet (including a premature DONE claim)          -> loop runs another iteration
+#   2  ledger missing or malformed (no STATUS line, no items, unfilled {{…}} placeholder)
+#                                                              -> loop stops with an error
+# A one-line summary goes to stderr.
+set -u
+
+ledger=${1:-LOOP_LEDGER.md}
+broken() { echo "seref-loop-gate: $ledger: $*" >&2; exit 2; }
+
+[[ -f $ledger ]] || broken "no such ledger"
+status=$(grep -m1 -E '^STATUS: ' "$ledger") || broken "no 'STATUS: ' line"
+case $status in
+    "STATUS: OPEN" | "STATUS: DONE") ;;
+    *) broken "STATUS must be OPEN or DONE, got '${status#STATUS: }'" ;;
+esac
+
+grep -q '{{[A-Z]' "$ledger" && broken "unfilled template placeholder: $(grep -m1 -o '{{[A-Z][^}]*}}' "$ledger")"
+total=$(grep -cE '^- \[[ x!]\] ' "$ledger")
+(( total > 0 )) || broken "no '- [ ]' / '- [x]' / '- [!]' items"
+open=$(grep -cE '^- \[ \] ' "$ledger")
+unproven=$(grep -E '^- \[x\] ' "$ledger" | grep -cvE '(DONE|INVALID): ')
+unexplained=$(grep -E '^- \[!\] ' "$ledger" | grep -cv 'BLOCKED: ')
+done_items=$(grep -cE '^- \[x\] ' "$ledger")
+blocked=$(grep -cE '^- \[!\] ' "$ledger")
+
+summary="${status#STATUS: }: $done_items done, $blocked blocked, $open open of $total"
+(( unproven )) && summary+="; $unproven [x] without DONE:/INVALID: evidence"
+(( unexplained )) && summary+="; $unexplained [!] without BLOCKED: reason"
+
+if [[ $status == "STATUS: DONE" ]] && (( open == 0 && unproven == 0 && unexplained == 0 )); then
+    echo "seref-loop-gate: $summary -> done" >&2
+    exit 0
+fi
+[[ $status == "STATUS: DONE" ]] && summary+=" -> DONE claim rejected"
+echo "seref-loop-gate: $summary" >&2
+exit 1
