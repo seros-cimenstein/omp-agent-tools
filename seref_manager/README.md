@@ -7,8 +7,7 @@ worker actually did and decides how the next iteration starts, and it answers `a
 nobody answers.
 
 It does not use omp's `judge` role. The manager is an ordinary chat model call with its own
-prompts (`extension/prompts/`): the `seref_manager` model role if you configure one, else the
-session's model.
+prompts (`extension/prompts/`), running on its own **Seref Manager** model role.
 
 ## How it works
 
@@ -69,7 +68,7 @@ Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
 
 | Command | What |
 |---|---|
-| `/seref_manager run <LOOP_X.md> [--max N] [--grace S] [--model SPEC[:effort]] [--context manager\|keep\|compact\|reset] [--away]` | start; the gate must exit 1 |
+| `/seref_manager run <LOOP_X.md> [--max N] [--grace S] [--model SPEC[:level]] [--context manager\|keep\|compact\|reset] [--away]` | start; the gate must exit 1 |
 | `/seref_manager pause` / `resume` | pause after the current turn / continue (re-reviews the last iteration) |
 | `/seref_manager stop` | end the loop |
 | `/seref_manager away [on\|off]` | toggle answering `ask` without the grace period |
@@ -78,19 +77,30 @@ Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
 Esc during a worker turn pauses the loop. `--context` defaults to `manager` (the manager picks
 per iteration); `reset` gives every iteration a fresh session, like `loop.mode: reset`.
 
-### Manager model and cost
+### Manager model
 
-Each iteration costs one manager call, plus one per `ask` it answers. Resolution order:
+The extension adds a **Seref Manager** role to omp's model picker: `/models` → Roles → Seref
+Manager, then pick a model and thinking level like for any other role. The assignment is saved in
+`modelRoles.seref_manager` (global or project, per `modelRoleStorage`); the same works by hand:
 
-1. `--model SPEC[:effort]`: anything omp's `--model` takes (`provider/id`, a bare id, `@role`).
-2. The `seref_manager` model role, e.g. in `~/.omp/agent/config.yml`:
-   ```yaml
-   modelRoles:
-     seref_manager: anthropic/claude-haiku-4-5
-   ```
-3. The session's model.
+```yaml
+modelRoles:
+  seref_manager: anthropic/claude-opus-5-5:xhigh
+```
 
-Effort is `medium` unless `--model` ends in `:effort`; a thinking suffix on the role is ignored.
+Which model a review uses, first match wins:
+
+1. `--model SPEC[:level]` on `run`: anything omp's `--model` takes (`provider/id`, a bare id, `@role`).
+2. The Seref Manager role, with its thinking level.
+3. The session's model at `high`.
+
+`auto`/`inherit` levels mean `high`; `off` disables reasoning. The role is read on every call, so
+changing it in `/models` mid-loop applies from the next review; `/seref_manager status` shows the
+model in use and where it came from. Cost: one manager call per iteration, plus one per `ask` it
+answers.
+
+The role is registered at runtime, not written to config.yml: uninstalling the extension removes
+it from the picker. A `modelTags.seref_manager` entry of your own takes precedence.
 
 ### Restarts and session switches
 

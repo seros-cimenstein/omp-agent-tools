@@ -10,7 +10,6 @@ const loop: PersistedLoop = {
 	graceMs: 120_000,
 	away: false,
 	modelSpec: undefined,
-	effort: "medium",
 	contextPolicy: "manager",
 	startLeafId: "leaf-7",
 	startSnapshot: parseLedger("STATUS: OPEN\n- [x] A1 a — DONE: x\n- [ ] A2 b"),

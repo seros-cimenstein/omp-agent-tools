@@ -1,45 +1,80 @@
 /**
- * One manager model call: own system prompt, no tools, text out. Uses omp's model registry
- * and credentials, so any model the session can use works.
+ * The manager's model: a `seref_manager` model role that shows up in omp's `/models` role picker
+ * (model and thinking level picked there like any other role), resolved through omp's own role
+ * resolver, plus the one manager call. Credentials come from omp's model registry.
  */
 import { completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { getModelMatchPreferences, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { cfgModelTags } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { findScopedSettings, type Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
-export const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-export type ManagerEffort = (typeof EFFORTS)[number];
+export const MANAGER_ROLE = "seref_manager";
+const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+/** A reasoning effort, or `off` for no reasoning. */
+export type ManagerEffort = (typeof EFFORTS)[number] | "off";
+/** Effort when the role (or `--model`) names none, or says `auto`/`inherit`. */
+const DEFAULT_EFFORT: ManagerEffort = "high";
 
 const TIMEOUT_MS = 5 * 60_000;
 const MAX_TOKENS = 16_000;
 
-/** Optional model role users can set in config.yml (`modelRoles.seref_manager`) for a cheaper manager. */
-const MANAGER_ROLE = "@seref_manager";
+export interface ManagerTarget {
+	model: Model;
+	effort: ManagerEffort;
+	/** Where the choice came from, for status lines. */
+	source: "--model" | "seref_manager role" | "session model";
+}
+
+/** The settings of the session whose handler is running (call inside a handler), else omp's global settings. */
+export function currentSettings(): Settings | undefined {
+	return findScopedSettings();
+}
 
 /**
- * Resolve `spec` (`provider/id`, bare id, `@role`, optional `:effort` suffix). Without one: the
- * `seref_manager` model role when configured, else the session's current model. Throws when
- * nothing matches.
+ * Make `seref_manager` a role in `/models` → Roles, so it can be assigned a model and thinking
+ * level there. The tag lives in the runtime override layer, not config.yml: uninstalling the
+ * extension removes the role from the picker, while an assignment stays in `modelRoles`. A tag
+ * the user defined in config wins.
  */
-export function resolveManagerModel(
-	ctx: ExtensionContext,
-	spec: string | undefined,
-	fallbackEffort: ManagerEffort,
-): { model: Model; effort: ManagerEffort } {
-	if (!spec) {
-		const model = ctx.models.resolve(MANAGER_ROLE) ?? ctx.models.current();
-		if (!model) throw new Error("the session has no model; pass --model");
-		return { model, effort: fallbackEffort };
+export function registerManagerRole(settings: Settings): void {
+	if (Object.hasOwn(cfgModelTags.get(settings), MANAGER_ROLE)) return;
+	cfgModelTags.override(settings, { [MANAGER_ROLE]: { name: "Seref Manager", color: "accent" } });
+}
+
+function toEffort(level: unknown): ManagerEffort {
+	if (level === "off") return "off";
+	return EFFORTS.find(effort => effort === level) ?? DEFAULT_EFFORT;
+}
+
+/**
+ * `spec` (`--model`: `provider/id`, bare id, `@role`, `:level` suffix) wins; then the
+ * `seref_manager` role when assigned; then the session's model. Model and thinking level go
+ * through omp's role resolver, so `@role` chains and `:level` suffixes behave as everywhere in omp.
+ * Resolved on every call, so a role change in `/models` applies from the next review on.
+ */
+export function resolveManagerModel(ctx: ExtensionContext, settings: Settings | undefined, spec: string | undefined): ManagerTarget {
+	const selector = spec ?? (settings?.getModelRole(MANAGER_ROLE) ? `@${MANAGER_ROLE}` : undefined);
+	if (!selector) {
+		const current = ctx.models.current();
+		if (!current) throw new Error("the session has no model; assign the Seref Manager role in /models or pass --model");
+		return { model: current, effort: DEFAULT_EFFORT, source: "session model" };
 	}
-	const suffix = /:([a-z]+)$/.exec(spec);
-	const effort = EFFORTS.find(candidate => candidate === suffix?.[1]);
-	const base = effort ? spec.slice(0, -(effort.length + 1)) : spec;
-	const model = ctx.models.resolve(base);
-	if (!model) throw new Error(`no model matches "${base}"`);
-	return { model, effort: effort ?? fallbackEffort };
+	const resolved = resolveModelRoleValue(selector, ctx.modelRegistry.getAvailable(), {
+		settings,
+		matchPreferences: getModelMatchPreferences(settings),
+	});
+	if (!resolved.model) throw new Error(`no available model matches ${selector}${resolved.warning ? ` (${resolved.warning})` : ""}`);
+	return { model: resolved.model, effort: toEffort(resolved.thinkingLevel), source: spec ? "--model" : "seref_manager role" };
+}
+
+export function describeTarget(target: ManagerTarget): string {
+	return `${target.model.provider}/${target.model.id}:${target.effort} (${target.source})`;
 }
 
 export async function callManager(
 	ctx: ExtensionContext,
-	target: { model: Model; effort: ManagerEffort },
+	target: ManagerTarget,
 	systemPrompt: string,
 	userText: string,
 	signal: AbortSignal,
@@ -49,7 +84,7 @@ export async function callManager(
 		{ systemPrompt: [systemPrompt], messages: [{ role: "user", content: userText, timestamp: Date.now() }] },
 		{
 			apiKey: ctx.modelRegistry.resolver(target.model, ctx.sessionManager.getSessionId()),
-			reasoning: target.effort,
+			...(target.effort === "off" ? { disableReasoning: true } : { reasoning: target.effort }),
 			maxTokens: MAX_TOKENS,
 			signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
 		},

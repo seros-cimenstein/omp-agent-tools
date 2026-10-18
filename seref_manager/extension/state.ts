@@ -20,7 +20,6 @@ export interface PersistedLoop {
 	graceMs: number;
 	away: boolean;
 	modelSpec: string | undefined;
-	effort: string;
 	contextPolicy: ContextPolicy;
 	startLeafId: string | null;
 	startSnapshot: LedgerSnapshot;
@@ -60,7 +59,6 @@ export function parsePersistedEntry(data: unknown): PersistedEntry | undefined {
 		typeof loop.ledgerPath !== "string" ||
 		typeof loop.cwd !== "string" ||
 		typeof loop.away !== "boolean" ||
-		typeof loop.effort !== "string" ||
 		!(loop.modelSpec === undefined || loop.modelSpec === null || typeof loop.modelSpec === "string") ||
 		!(loop.startLeafId === null || typeof loop.startLeafId === "string") ||
 		!numbers.every(value => typeof value === "number" && Number.isFinite(value)) ||
@@ -83,7 +81,6 @@ export function parsePersistedEntry(data: unknown): PersistedEntry | undefined {
 			graceMs: Number(loop.graceMs),
 			away: loop.away,
 			modelSpec: typeof loop.modelSpec === "string" ? loop.modelSpec : undefined,
-			effort: loop.effort,
 			contextPolicy,
 			startLeafId: loop.startLeafId,
 			startSnapshot,
