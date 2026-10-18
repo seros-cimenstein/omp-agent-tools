@@ -5,6 +5,8 @@
  * The manager never ticks anything; it only moves `[x]`/`[!]` back to `[ ]` with a
  * `— MANAGER(itN): …` note, so the gate keeps sole authority over "done".
  */
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export type ItemState = "open" | "done" | "blocked";
 
@@ -88,13 +90,16 @@ function stripSuffixes(rest: string): string {
 }
 
 /**
- * Apply reopen/unblock edits for iteration `iteration`. An edit applies only to an item in the
- * state it expects (`reopen` needs `[x]`, `unblock` needs `[!]`); anything else is skipped with a reason.
+ * Apply reopen/unblock edits, tagging each line `— MANAGER(<stamp>): …` (`it4`, `audit`). An edit
+ * applies only to an item in the state it expects (`reopen` needs `[x]`, `unblock` needs `[!]`);
+ * anything else is skipped with a reason. A ledger that claimed `STATUS: DONE` goes back to
+ * `STATUS: OPEN` once an item is open again, so the worker never has to repair the claim itself
+ * (it tends to invent statuses the gate rejects).
  */
 export function applyEdits(
 	text: string,
 	edits: readonly LedgerEdit[],
-	iteration: number,
+	stamp: string,
 ): { text: string; applied: LedgerEdit[]; skipped: SkippedEdit[] } {
 	const lines = text.split("\n");
 	const applied: LedgerEdit[] = [];
@@ -114,10 +119,37 @@ export function applyEdits(
 			skipped.push({ edit, why: `item is not [${wanted}]` });
 			continue;
 		}
-		const label = edit.kind === "reopen" ? "reopened" : "blocker rejected";
-		lines[index] =
-			`- [ ] ${edit.id}${stripSuffixes(match[3])} — MANAGER(it${iteration}): ${label}: ${sanitizeReason(edit.reason)}`;
+		const action = edit.kind === "reopen" ? "reopened" : "blocker rejected";
+		lines[index] = `- [ ] ${edit.id}${stripSuffixes(match[3])} — MANAGER(${stamp}): ${action}: ${sanitizeReason(edit.reason)}`;
 		applied.push(edit);
 	}
+	if (applied.length > 0) {
+		const status = lines.findIndex(line => STATUS_LINE.test(line));
+		if (status !== -1 && lines[status] === "STATUS: DONE") lines[status] = "STATUS: OPEN";
+	}
 	return { text: lines.join("\n"), applied, skipped };
+}
+
+const LEDGER_NAME = /^LOOP_.+\.md$/;
+
+/**
+ * seref_loop ledgers (`LOOP_*.md`, not the `*.manager.md` audit logs) directly inside `dirs`,
+ * as absolute paths, deduplicated, in directory order then name order.
+ */
+export function findLedgers(dirs: readonly string[]): string[] {
+	const found = new Set<string>();
+	for (const dir of dirs) {
+		let names: string[];
+		try {
+			names = fs.readdirSync(dir).sort();
+		} catch {
+			continue;
+		}
+		for (const name of names) {
+			if (!LEDGER_NAME.test(name) || name.endsWith(".manager.md")) continue;
+			const file = path.resolve(dir, name);
+			if (fs.statSync(file).isFile()) found.add(file);
+		}
+	}
+	return [...found];
 }

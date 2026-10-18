@@ -25,6 +25,9 @@ flowchart TD
   L -->|"keep / compact / fresh session"| W
 ```
 
+Before the first iteration, `run` audits the ledger when it already has `[x]` or `[!]` items (see
+[Taking over a ledger](#taking-over-a-ledger)).
+
 After each worker yield:
 
 1. **Gate.** `seref-loop-gate LOOP_X.md`: exit 2 ends the loop with the error. Exit 0 ends it as
@@ -68,7 +71,7 @@ Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
 
 | Command | What |
 |---|---|
-| `/seref_manager run <LOOP_X.md> [--max N] [--grace S] [--model SPEC[:level]] [--context manager\|keep\|compact\|reset] [--away]` | start; the gate must exit 1 |
+| `/seref_manager run [LOOP_X.md] [--max N] [--grace S] [--model SPEC[:level]] [--context manager\|keep\|compact\|reset] [--away] [--no-audit] [--force]` | start; without a path it finds the ledger itself |
 | `/seref_manager pause` / `resume` | pause after the current turn / continue (re-reviews the last iteration) |
 | `/seref_manager stop` | end the loop |
 | `/seref_manager away [on\|off]` | toggle answering `ask` without the grace period |
@@ -102,6 +105,40 @@ answers.
 The role is registered at runtime, not written to config.yml: uninstalling the extension removes
 it from the picker. A `modelTags.seref_manager` entry of your own takes precedence.
 
+### Taking over a ledger
+
+`/seref_manager run` with no path uses the `LOOP_*.md` in the working directory or the git repo
+root, and asks which one when there are several.
+
+If the ledger already has `[x]` or `[!]` items, for example because you ran omp's plain `/loop`
+on it, the manager audits them before the loop continues, even when that loop already finished.
+No transcript of that work exists, so the audit checks the repository instead, with tools that
+stay inside the repo:
+
+- `read_file`, `search` (ripgrep) and `git` (status, diff, log, show, blame, ls-files, grep) to
+  look at the code and its history.
+- `run_check` to run a command exactly as the ledger writes it in backticks (an acceptance
+  command, the Protocol's test command). Anything else is refused, and so are ledger commands that
+  deploy, delete, write files, install, push or reach other hosts (`ssh`, `rm`, `git push`, `>`,
+  `curl -X POST`, …).
+
+Each `[x]` comes out `holds`, `reopen` (the line becomes `- [ ] … — MANAGER(audit): reopened: …`)
+or `unverifiable` (needs a live host or a deploy, so it stays ticked). Each `[!]` is kept or
+unblocked. The audit uses up to 60 tool calls and 30 minutes; its findings and every tool call go
+to `LOOP_X.manager.md`. When the gate still passes afterwards there is nothing left to run; otherwise
+iteration 1 starts with the audit's findings in its prompt. `--no-audit` skips it.
+
+### omp's own `/loop`
+
+Both loops send a prompt after every turn, so they must not run together. Extensions cannot read
+omp's loop state, so seref_manager tracks it from what reaches extensions:
+
+- `run` refuses while you have typed `/loop` (which turns it on) without turning it off again.
+  If it ended by itself (a limit or its `--until` check), `--force` starts anyway.
+- While seref_manager runs, typing `/loop` to turn omp's loop on is blocked.
+- If omp's loop resubmits a prompt during a seref_manager run anyway, the run pauses and says so:
+  type `/loop` to turn it off, then `/seref_manager resume`.
+
 ### Restarts and session switches
 
 Loop state is saved in the session (custom `seref_manager_state` entries, invisible to the
@@ -115,7 +152,8 @@ newest one carries the state.
 
 ```bash
 ./install.sh     # links extension/ to ~/.omp/agent/extensions/seref_manager; restart omp
-bun test         # ledger edits (against the real gate), reply parsing, transcript digest, state restore
+bun test         # ledger edits (against the real gate), ledger discovery, reply parsing, transcript
+                 # digest, state restore, tool safety (allowlist, denylist, repo confinement)
 ```
 
 The gate is found at `../seref_loop/bin/seref-loop-gate`, relative to this repo's real path;
@@ -123,7 +161,9 @@ set `SEREF_LOOP_GATE` to use another one.
 
 ## Limits
 
-- The manager reviews only items that changed state in the iteration it sees. An unproven tick
-  from an earlier run is not re-checked.
+- During the loop the manager reviews only items that changed state in the iteration it sees;
+  items ticked before it took over are covered by the audit.
+- The audit cannot verify checks that need live hosts or deploys; those items are reported
+  `unverifiable` and stay ticked.
 - After an omp restart the loop needs one `/seref_manager resume`: starting a fresh session
   needs a command context, and only a command provides one.

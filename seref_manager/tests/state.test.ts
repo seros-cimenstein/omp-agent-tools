@@ -17,6 +17,7 @@ const loop: PersistedLoop = {
 	reopenCounts: { A1: 2 },
 	managerFailures: 0,
 	history: ["- it2: continue, fine"],
+	audited: true,
 };
 
 const custom = (data: unknown) => ({ type: "custom", customType: STATE_ENTRY_TYPE, data });

@@ -129,3 +129,34 @@ export function parseAskAnswers(text: string, questions: readonly AskQuestion[])
 		};
 	});
 }
+
+const AUDIT_RESULTS = ["holds", "reopen", "unverifiable", "keep", "unblock"] as const;
+export type AuditResult = (typeof AUDIT_RESULTS)[number];
+
+export interface AuditVerdict {
+	checks: { id: string; result: AuditResult; how: string }[];
+	summary: string;
+	/** `reopen`/`unblock` checks as ledger edits; the reason is how the manager found out. */
+	edits: LedgerEdit[];
+}
+
+/**
+ * Parse the manager's audit of items it did not supervise. `holds`/`reopen`/`unverifiable`
+ * judge `[x]` items, `keep`/`unblock` judge `[!]` items; the ledger edit only applies when the
+ * item really is in that state.
+ */
+export function parseAuditVerdict(text: string): AuditVerdict {
+	const raw = extractJsonObject(text);
+	if (!isRecord(raw)) throw new Error("reply is not a JSON object");
+	const checks = arrayField(raw, "checks").map(entry => {
+		const result = AUDIT_RESULTS.find(candidate => candidate === entry.result);
+		if (!result) throw new Error(`"result" must be one of ${AUDIT_RESULTS.join(", ")}`);
+		return { id: stringField(entry, "id"), result, how: stringField(entry, "how", "") };
+	});
+	const edits: LedgerEdit[] = checks.flatMap(check =>
+		check.result === "reopen" || check.result === "unblock"
+			? [{ id: check.id, kind: check.result, reason: check.how || "failed the manager's audit" }]
+			: [],
+	);
+	return { checks, summary: stringField(raw, "summary", ""), edits };
+}

@@ -27,6 +27,8 @@ export interface PersistedLoop {
 	reopenCounts: Record<string, number>;
 	managerFailures: number;
 	history: string[];
+	/** False until the start-of-run audit of unsupervised ticks finished (or was skipped). */
+	audited: boolean;
 }
 
 /** What one state entry records: the loop, or `null` once it ended. */
@@ -88,6 +90,8 @@ export function parsePersistedEntry(data: unknown): PersistedEntry | undefined {
 			reopenCounts: Object.fromEntries(Object.entries(loop.reopenCounts).map(([id, count]) => [id, Number(count)])),
 			managerFailures: Number(loop.managerFailures),
 			history: loop.history,
+			// Entries from before the audit existed belong to loops that were already running.
+			audited: loop.audited !== false,
 		},
 	};
 }

@@ -3,7 +3,7 @@
  * (model and thinking level picked there like any other role), resolved through omp's own role
  * resolver, plus the one manager call. Credentials come from omp's model registry.
  */
-import { completeSimple, type Model } from "@oh-my-pi/pi-ai";
+import { completeSimple, type Message, type Model, type SimpleStreamOptions } from "@oh-my-pi/pi-ai";
 import type { ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getModelMatchPreferences, resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { cfgModelTags } from "@oh-my-pi/pi-coding-agent/config/model-settings";
@@ -95,4 +95,87 @@ export async function callManager(
 	const text = message.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
 	if (!text.trim()) throw new Error("manager model returned no text");
 	return text;
+}
+
+/** Tool calls tolerated past the budget (each answered with an error) before the call fails. */
+const OVER_BUDGET_CALLS = 8;
+
+export interface ToolCallRecord {
+	name: string;
+	args: string;
+	isError: boolean;
+	/** First line of the result, for the audit log. */
+	summary: string;
+}
+
+/**
+ * A manager call that may investigate first: the model calls `tools` (executed by `execute`)
+ * until it answers in text. After `maxCalls` tool calls, further calls get an error result and
+ * the model is told to answer; `toolChoice: "none"` then forces the reply.
+ */
+export async function callManagerWithTools(
+	ctx: ExtensionContext,
+	target: ManagerTarget,
+	systemPrompt: string,
+	userText: string,
+	signal: AbortSignal,
+	options: {
+		tools: readonly { name: string; description: string; parameters: Record<string, unknown> }[];
+		execute: (name: string, args: unknown, signal: AbortSignal) => Promise<{ text: string; isError: boolean }>;
+		maxCalls: number;
+		onCall?: (record: ToolCallRecord) => void;
+	},
+): Promise<{ text: string; calls: ToolCallRecord[] }> {
+	const messages: Message[] = [{ role: "user", content: userText, timestamp: Date.now() }];
+	const calls: ToolCallRecord[] = [];
+	const reasoning: SimpleStreamOptions =
+		target.effort === "off" ? { disableReasoning: true } : { reasoning: target.effort };
+	for (;;) {
+		if (calls.length >= options.maxCalls + OVER_BUDGET_CALLS) throw new Error("manager kept calling tools past its budget");
+		const exhausted = calls.length >= options.maxCalls;
+		const message = await completeSimple(
+			target.model,
+			{ systemPrompt: [systemPrompt], messages, tools: [...options.tools] },
+			{
+				apiKey: ctx.modelRegistry.resolver(target.model, ctx.sessionManager.getSessionId()),
+				...reasoning,
+				maxTokens: MAX_TOKENS,
+				signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
+				...(exhausted ? { toolChoice: "none" as const } : {}),
+			},
+		);
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			throw new Error(`manager model ${message.stopReason}: ${message.errorMessage ?? "no detail"}`);
+		}
+		messages.push(message);
+		const toolCalls = message.content.flatMap(block => (block.type === "toolCall" ? [block] : []));
+		if (toolCalls.length === 0) {
+			const text = message.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
+			if (!text.trim()) throw new Error("manager model returned no text");
+			return { text, calls };
+		}
+		for (const call of toolCalls) {
+			const result =
+				calls.length >= options.maxCalls
+					? { text: "Tool budget used up. Answer now with what you found; mark what you could not check as unverifiable.", isError: true }
+					: await options.execute(call.name, call.arguments, signal);
+			if (signal.aborted) throw new Error("manager call aborted");
+			const record: ToolCallRecord = {
+				name: call.name,
+				args: JSON.stringify(call.arguments),
+				isError: result.isError,
+				summary: result.text.split("\n", 1)[0].slice(0, 160),
+			};
+			calls.push(record);
+			options.onCall?.(record);
+			messages.push({
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: result.text }],
+				isError: result.isError,
+				timestamp: Date.now(),
+			});
+		}
+	}
 }

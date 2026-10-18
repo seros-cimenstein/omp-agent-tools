@@ -16,8 +16,24 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { askToolRenderer } from "@oh-my-pi/pi-tui/tools/ask";
-import { applyEdits, changedItems, countItems, type LedgerItem, type LedgerSnapshot, parseLedger, progressKey } from "./ledger";
-import { callManager, currentSettings, describeTarget, registerManagerRole, resolveManagerModel } from "./model";
+import {
+	applyEdits,
+	changedItems,
+	countItems,
+	findLedgers,
+	type LedgerItem,
+	type LedgerSnapshot,
+	parseLedger,
+	progressKey,
+} from "./ledger";
+import {
+	callManager,
+	callManagerWithTools,
+	currentSettings,
+	describeTarget,
+	registerManagerRole,
+	resolveManagerModel,
+} from "./model";
 import {
 	CONTEXT_POLICIES,
 	type ContextPolicy,
@@ -27,12 +43,21 @@ import {
 	STATE_ENTRY_TYPE,
 } from "./state";
 import { digestIteration, lastAssistant } from "./transcript";
-import { type AskAnswer, type AskQuestion, type IterationVerdict, parseAskAnswers, parseIterationVerdict } from "./verdict";
+import { ledgerCommands, MANAGER_TOOLS, runManagerTool } from "./tools";
+import {
+	type AskAnswer,
+	type AskQuestion,
+	type IterationVerdict,
+	parseAskAnswers,
+	parseAuditVerdict,
+	parseIterationVerdict,
+} from "./verdict";
 
 const HERE = fs.realpathSync(import.meta.dir);
 const GATE = process.env.SEREF_LOOP_GATE ?? path.resolve(HERE, "../../seref_loop/bin/seref-loop-gate");
 const PROMPT_ITERATION = fs.readFileSync(path.join(HERE, "prompts/iteration.md"), "utf8");
 const PROMPT_ASK = fs.readFileSync(path.join(HERE, "prompts/ask.md"), "utf8");
+const PROMPT_AUDIT = fs.readFileSync(path.join(HERE, "prompts/audit.md"), "utf8");
 const PROMPT_WORKER = fs.readFileSync(path.join(HERE, "prompts/worker.md"), "utf8").trim();
 const DECISIONS_WITH_ASK =
 	"For a decision only the user can make, call `ask`: the loop manager answers it or tells you to mark the item blocked.";
@@ -53,6 +78,9 @@ const HISTORY_KEEP = 8;
 const GATE_TIMEOUT_MS = 30_000;
 const IDLE_POLL_MS = 250;
 const IDLE_POLL_LIMIT = 120;
+/** Tool calls the audit may make; a full suite run usually covers many items at once. */
+const AUDIT_TOOL_CALLS = 60;
+const AUDIT_TIMEOUT_MS = 30 * 60_000;
 
 /** The native ask renderer; `mergeCallAndResult` is not in ToolDefinition's type but is forwarded at runtime. */
 const ASK_RENDERING = {
@@ -64,7 +92,7 @@ const ASK_RENDERING = {
 };
 
 const USAGE = [
-	"/seref_manager run <LOOP_X.md> [--max N] [--grace SECONDS] [--model SPEC[:level]] [--context manager|keep|compact|reset] [--away]",
+	"/seref_manager run [LOOP_X.md] [--max N] [--grace SECONDS] [--model SPEC[:level]] [--context manager|keep|compact|reset] [--away] [--no-audit] [--force]",
 	"/seref_manager pause | resume | stop | status | away [on|off]",
 ].join("\n");
 
@@ -82,16 +110,20 @@ interface LoopState extends PersistedLoop {
 }
 
 interface RunArgs {
+	/** Empty: find the `LOOP_*.md` in the working directory or repo root. */
 	ledger: string;
 	max?: number;
 	graceSeconds?: number;
 	model?: string;
 	context: ContextPolicy;
 	away: boolean;
+	audit: boolean;
+	/** Start even though omp's own `/loop` looks active. */
+	force: boolean;
 }
 
 function parseRunArgs(tokens: string[]): RunArgs {
-	const args: RunArgs = { ledger: "", context: "manager", away: false };
+	const args: RunArgs = { ledger: "", context: "manager", away: false, audit: true, force: false };
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
 		const value = (): string => {
@@ -108,6 +140,8 @@ function parseRunArgs(tokens: string[]): RunArgs {
 		else if (token === "--grace") args.graceSeconds = count(value(), 0);
 		else if (token === "--model") args.model = value();
 		else if (token === "--away") args.away = true;
+		else if (token === "--no-audit") args.audit = false;
+		else if (token === "--force") args.force = true;
 		else if (token === "--context") {
 			const policy = value();
 			const match = CONTEXT_POLICIES.find(candidate => candidate === policy);
@@ -117,7 +151,6 @@ function parseRunArgs(tokens: string[]): RunArgs {
 		else if (args.ledger) throw new Error(`unexpected argument ${token}`);
 		else args.ledger = token;
 	}
-	if (!args.ledger) throw new Error("missing ledger path");
 	return args;
 }
 
@@ -151,6 +184,7 @@ function toPersisted(loop: LoopState): PersistedLoop {
 		reopenCounts: loop.reopenCounts,
 		managerFailures: loop.managerFailures,
 		history: loop.history,
+		audited: loop.audited,
 	};
 }
 
@@ -160,6 +194,17 @@ export default function serefManager(pi: ExtensionAPI): void {
 	let settings: Settings | undefined;
 	let askShadowed = false;
 	let askQueue: Promise<unknown> = Promise.resolve();
+	/**
+	 * omp's own `/loop` cannot be read by extensions, so it is tracked from what reaches them:
+	 * typed `/loop` commands toggle it (as omp does), and its resubmissions are the only prompts
+	 * that start a run without being typed (no `input` event) or sent by this loop.
+	 */
+	let builtinLoopLikelyOn = false;
+	/** Typed prompts not yet seen starting a run, by text; consumed by `before_agent_start`. */
+	const pendingTyped = new Map<string, number>();
+	/** Every prompt the user typed this process, to recognize a resubmission of one. */
+	const everTyped = new Set<string>();
+	let lastSentPrompt: string | undefined;
 
 	const persist = (loop: LoopState | undefined): void => {
 		const entry: PersistedEntry = { version: 1, loop: loop ? toPersisted(loop) : null };
@@ -225,8 +270,12 @@ export default function serefManager(pi: ExtensionAPI): void {
 			.replaceAll("{{max}}", String(loop.max))
 			.replaceAll("{{ledger}}", displayPath(loop.cwd, loop.ledgerPath))
 			.replaceAll("{{decisions}}", loop.askAvailable ? DECISIONS_WITH_ASK : DECISIONS_WITHOUT_ASK);
-		if (notes.length > 0) prompt += `\n\nManager notes from iteration ${loop.iteration - 1}:\n${notes.join("\n")}`;
+		if (notes.length > 0) {
+			const source = loop.iteration === 1 ? "the audit" : `iteration ${loop.iteration - 1}`;
+			prompt += `\n\nManager notes from ${source}:\n${notes.join("\n")}`;
+		}
 		updateStatus(ctx);
+		lastSentPrompt = prompt.trim();
 		pi.sendUserMessage(prompt, { attribution: "agent" });
 	};
 
@@ -348,7 +397,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const notes: string[] = [];
 			let snapshot = after;
 			if (verdict) {
-				const edited = applyEdits(ledgerText, verdict.edits, loop.iteration);
+				const edited = applyEdits(ledgerText, verdict.edits, `it${loop.iteration}`);
 				if (edited.applied.length > 0) {
 					await Bun.write(loop.ledgerPath, edited.text);
 					snapshot = parseLedger(edited.text);
@@ -576,15 +625,131 @@ export default function serefManager(pi: ExtensionAPI): void {
 		);
 	};
 
+	const repoRoot = async (cwd: string): Promise<string> => {
+		const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 10_000 });
+		return result.code === 0 && result.stdout.trim() ? result.stdout.trim() : cwd;
+	};
+
+	/** The ledger in the working directory or repo root; asks which one when there are several. */
+	const pickLedger = async (ctx: ExtensionContext, root: string): Promise<string> => {
+		const dirs = root === ctx.cwd ? [ctx.cwd] : [ctx.cwd, root];
+		const found = findLedgers(dirs);
+		if (found.length === 0) {
+			throw new Error(`no LOOP_*.md in ${dirs.join(" or ")}; write one with /seref_loop or pass its path`);
+		}
+		if (found.length === 1) return found[0];
+		const labels = found.map(file => {
+			const snapshot = parseLedger(fs.readFileSync(file, "utf8"));
+			const counts = countItems(snapshot);
+			return `${displayPath(ctx.cwd, file)}  (${snapshot.status ?? "no STATUS"}: ${counts.done} done, ${counts.blocked} blocked, ${counts.open} open)`;
+		});
+		if (!ctx.hasUI) throw new Error(`several ledgers here, pass one: ${found.map(file => displayPath(ctx.cwd, file)).join(", ")}`);
+		const choice = await ctx.ui.select("Which ledger should seref_manager run?", labels);
+		const index = choice === undefined ? -1 : labels.indexOf(choice);
+		if (index === -1) throw new Error("no ledger chosen");
+		return found[index];
+	};
+
+	/**
+	 * Check every `[x]`/`[!]` item the manager did not supervise, with tools: read the code, git
+	 * history, run the ledger's own checks. Reopens what does not hold and rejects weak blockers.
+	 * Returns notes for the first worker prompt.
+	 */
+	const runAudit = async (ctx: ExtensionContext, loop: LoopState): Promise<string[]> => {
+		const ledgerText = await Bun.file(loop.ledgerPath).text();
+		const items = parseLedger(ledgerText).items.filter(item => item.state !== "open");
+		if (items.length === 0) return [];
+		const target = resolveManagerModel(ctx, settings, loop.modelSpec);
+		const root = await repoRoot(loop.cwd);
+		ctx.ui.notify(
+			`seref_manager: auditing ${items.length} item(s) ticked or blocked before it took over, with ${describeTarget(target)}. /seref_manager pause stops it.`,
+			"info",
+		);
+		const input = [
+			`## Items to audit\n${items.map(item => item.line).join("\n")}`,
+			`## Commands run_check may run (backticked in the ledger)\n${[...ledgerCommands(ledgerText)].map(command => `- ${command}`).join("\n") || "(none)"}`,
+			`## Repository root\n${root}`,
+			`## Ledger (${displayPath(root, loop.ledgerPath)})\n${ledgerText}`,
+		].join("\n\n");
+		let callCount = 0;
+		const { text, calls } = await callManagerWithTools(
+			ctx,
+			target,
+			PROMPT_AUDIT,
+			input,
+			AbortSignal.any([loop.abort.signal, AbortSignal.timeout(AUDIT_TIMEOUT_MS)]),
+			{
+				tools: MANAGER_TOOLS,
+				execute: (name, args, signal) =>
+					runManagerTool(name, args, { root, ledgerText: () => fs.readFileSync(loop.ledgerPath, "utf8"), signal }),
+				maxCalls: AUDIT_TOOL_CALLS,
+				onCall: record => ctx.ui.setStatus("seref_manager", `seref audit · ${++callCount} tool calls · last: ${record.name}`),
+			},
+		);
+		const verdict = parseAuditVerdict(text);
+		const edited = applyEdits(await Bun.file(loop.ledgerPath).text(), verdict.edits, "audit");
+		if (edited.applied.length > 0) await Bun.write(loop.ledgerPath, edited.text);
+		for (const edit of edited.applied) {
+			if (edit.kind === "reopen") loop.reopenCounts[edit.id] = (loop.reopenCounts[edit.id] ?? 0) + 1;
+		}
+		const tally = (result: string): number => verdict.checks.filter(check => check.result === result).length;
+		const reopened = edited.applied.filter(edit => edit.kind === "reopen").map(edit => edit.id);
+		const unblocked = edited.applied.filter(edit => edit.kind === "unblock").map(edit => edit.id);
+		const summary = `${tally("holds")} hold, ${reopened.length} reopened${reopened.length ? ` (${reopened.join(", ")})` : ""}, ${tally("unverifiable")} unverifiable, ${tally("keep")} blockers kept, ${unblocked.length} unblocked${unblocked.length ? ` (${unblocked.join(", ")})` : ""}`;
+		log(
+			loop,
+			[
+				`## Audit of unsupervised items (${calls.length} tool calls)`,
+				verdict.summary,
+				...verdict.checks.map(check => `- ${check.id}: ${check.result}. ${check.how}`),
+				...edited.skipped.map(skip => `- skipped ${skip.edit.kind} ${skip.edit.id}: ${skip.why}`),
+				"",
+				"Tool calls:",
+				...calls.map(call => `- ${call.name} ${call.args} → ${call.isError ? "ERROR " : ""}${call.summary}`),
+			].join("\n"),
+		);
+		loop.history = [...loop.history, `- audit: ${summary}`].slice(-HISTORY_KEEP);
+		ctx.ui.notify(`seref_manager: audit done: ${summary}. ${verdict.summary}`, reopened.length > 0 ? "warning" : "info");
+		return edited.applied.map(
+			edit => `- ${edit.id} ${edit.kind === "reopen" ? "was reopened by the manager's audit" : "blocker was rejected by the manager's audit"}: ${edit.reason}`,
+		);
+	};
+
+	/** Audit (unless done already), then start iteration 1, or finish when the gate passes after all. */
+	const auditThenStart = async (ctx: ExtensionContext, loop: LoopState): Promise<void> => {
+		try {
+			const notes = loop.audited ? [] : await runAudit(ctx, loop);
+			if (state !== loop || loop.paused) return;
+			loop.audited = true;
+			const gate = await runGate(loop);
+			if (gate.code === 0) return finish(ctx, `gate passes after the audit (${gate.summary}); nothing left to run.`, "info");
+			if (gate.code !== 1) return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error");
+			startIteration(ctx, loop, parseLedger(await Bun.file(loop.ledgerPath).text()), notes);
+		} catch (error) {
+			if (state === loop && !loop.paused) {
+				pause(ctx, `audit failed: ${errorText(error)}. /seref_manager resume retries it; run with --no-audit to skip it.`);
+			}
+		}
+	};
+
 	const startRun = async (ctx: ExtensionCommandContext, tokens: string[]): Promise<void> => {
 		if (state) throw new Error(`a loop is already running on ${displayPath(ctx.cwd, state.ledgerPath)}; /seref_manager stop first`);
 		const args = parseRunArgs(tokens);
-		const ledgerPath = path.resolve(ctx.cwd, args.ledger.replace(/^~(?=\/)/, process.env.HOME ?? "~"));
-		if (!fs.existsSync(ledgerPath)) throw new Error(`no ledger at ${ledgerPath}`);
+		if (builtinLoopLikelyOn && !args.force) {
+			throw new Error(
+				"omp's own /loop looks active in this session, and both loops would send a prompt after every turn. Type /loop to turn it off (the status line shows a Loop indicator while it is on); if it already ended by itself, add --force.",
+			);
+		}
 		if (!fs.existsSync(GATE)) throw new Error(`gate not found at ${GATE} (set SEREF_LOOP_GATE)`);
+		const ledgerPath = args.ledger
+			? path.resolve(ctx.cwd, args.ledger.replace(/^~(?=\/)/, process.env.HOME ?? "~"))
+			: await pickLedger(ctx, await repoRoot(ctx.cwd));
+		if (!fs.existsSync(ledgerPath)) throw new Error(`no ledger at ${ledgerPath}`);
 		const target = resolveManagerModel(ctx, settings, args.model);
 
 		const snapshot = parseLedger(await Bun.file(ledgerPath).text());
+		const unsupervised = snapshot.items.filter(item => item.state !== "open").length;
+		const audit = args.audit && unsupervised > 0;
 		const loop: LoopState = {
 			ledgerPath,
 			cwd: ctx.cwd,
@@ -600,6 +765,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			reopenCounts: {},
 			managerFailures: 0,
 			history: [],
+			audited: !audit,
 			paused: false,
 			busy: false,
 			resetting: false,
@@ -608,11 +774,11 @@ export default function serefManager(pi: ExtensionAPI): void {
 			abort: new AbortController(),
 		};
 		const gate = await runGate(loop);
-		if (gate.code === 0) {
-			ctx.ui.notify(`seref_manager: gate already passes (${gate.summary}); nothing to run`, "info");
+		if (gate.code !== 0 && gate.code !== 1) throw new Error(`gate exit ${gate.code}: ${gate.summary}`);
+		if (gate.code === 0 && !audit) {
+			ctx.ui.notify(`seref_manager: gate already passes (${gate.summary}) and there is nothing to audit; nothing to run`, "info");
 			return;
 		}
-		if (gate.code !== 1) throw new Error(`gate exit ${gate.code}: ${gate.summary}`);
 		loop.askAvailable = shadowAsk();
 		const askNote = loop.askAvailable
 			? `ask answered after ${loop.away ? 0 : loop.graceMs / 1000}s`
@@ -621,13 +787,19 @@ export default function serefManager(pi: ExtensionAPI): void {
 		state = loop;
 		log(
 			loop,
-			`# seref_manager run (${new Date().toISOString()})\n\nLedger: ${ledgerPath}\nMax iterations: ${loop.max}\nManager model: ${modelName}\nContext: ${loop.contextPolicy}\nStart: ${gate.summary}`,
+			`# seref_manager run (${new Date().toISOString()})\n\nLedger: ${ledgerPath}\nMax iterations: ${loop.max}\nManager model: ${modelName}\nContext: ${loop.contextPolicy}\nStart: ${gate.summary}${audit ? `\nAudit: ${unsupervised} unsupervised item(s)` : ""}`,
 		);
 		ctx.ui.notify(
 			`seref_manager: running ${displayPath(ctx.cwd, ledgerPath)}, max ${loop.max} iterations, manager ${modelName}, context ${loop.contextPolicy}, ${askNote}. ${gate.summary}`,
 			"info",
 		);
-		startIteration(ctx, loop, snapshot, []);
+		if (audit) {
+			persist(loop);
+			updateStatus(ctx);
+			void auditThenStart(ctx, loop);
+		} else {
+			startIteration(ctx, loop, snapshot, []);
+		}
 	};
 
 	pi.registerCommand("seref_manager", {
@@ -658,7 +830,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 						persist(loop);
 						updateStatus(ctx);
 						ctx.ui.notify("seref_manager: resumed", "info");
-						void advance(ctx);
+						if (loop.iteration === 0) void auditThenStart(ctx, loop);
+						else void advance(ctx);
 						return;
 					}
 					case "stop":
@@ -707,6 +880,46 @@ export default function serefManager(pi: ExtensionAPI): void {
 				ctx.ui.notify(`seref_manager: ${errorText(error)}\n${USAGE}`, "error");
 			}
 		},
+	});
+
+	// omp's own /loop: keep it from starting while this loop drives, and track it for `run`.
+	pi.on("input", (event, ctx) => {
+		if (event.source !== "interactive") return;
+		const text = event.text.trim();
+		if (/^\/loop(\s|$)/.test(text)) {
+			// While on, `/loop` turns it off, which is always allowed; turning it on would double-drive.
+			if (state && !builtinLoopLikelyOn) {
+				ctx.ui.notify(
+					"seref_manager: not starting omp's /loop while seref_manager drives this session; both would send a prompt after every turn. /seref_manager stop first.",
+					"warning",
+				);
+				return { handled: true };
+			}
+			builtinLoopLikelyOn = !builtinLoopLikelyOn;
+			return;
+		}
+		if (text.startsWith("/")) return;
+		pendingTyped.set(text, (pendingTyped.get(text) ?? 0) + 1);
+		everTyped.add(text);
+	});
+
+	// A run this loop did not send and nobody typed, repeating a typed prompt, is omp's /loop resubmitting.
+	pi.on("before_agent_start", (event, ctx) => {
+		const prompt = event.prompt.trim();
+		if (prompt === lastSentPrompt) return;
+		const pending = pendingTyped.get(prompt) ?? 0;
+		if (pending > 0) {
+			if (pending === 1) pendingTyped.delete(prompt);
+			else pendingTyped.set(prompt, pending - 1);
+			return;
+		}
+		const loop = state;
+		if (!loop || loop.paused || !(everTyped.has(prompt) || builtinLoopLikelyOn)) return;
+		builtinLoopLikelyOn = true;
+		pause(
+			ctx,
+			`omp's /loop is also driving this session (it resubmitted "${prompt.slice(0, 60)}${prompt.length > 60 ? "…" : ""}"). Type /loop to turn it off, then /seref_manager resume.`,
+		);
 	});
 
 	pi.on("agent_end", (event, ctx) => {
