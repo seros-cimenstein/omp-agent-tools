@@ -87,3 +87,12 @@ live in `templates/LEDGER.md`, which is copied, not rendered.
   compaction per iteration instead.
 - One ledger per goal. Keep it at the repo root next to the code it fixes; delete it after the
   loop ends (the gate treats a missing ledger as an error, so not while it runs).
+- **Usage limits under plain `/loop`.** omp's `/loop` does not look at how a turn ended: when the
+  provider's usage limit (Claude 5-hour/weekly window, Codex limit) runs out, every iteration fails
+  within seconds and `/loop` resubmits after 0.8 s. A count loop (`/loop 40 …`) burns its whole
+  count without doing work, a duration loop spins until its deadline, and the gate runs each time
+  (harmless: the ledger is untouched). To make plain `/loop` survive a limit, set
+  `retry.waitForUsageReset: true` in `~/.omp/agent/config.yml`: when omp knows the reset time it
+  then sleeps until the reset inside the turn, and `/loop` never sees a failure. When omp does not
+  know the reset time it still gives up, so the count still burns. `/seref_manager` handles both
+  cases and continues by itself after the reset.
