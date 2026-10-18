@@ -3,9 +3,10 @@
 STATUS: OPEN
 
 Source: {{SOURCE — the findings/plan these items come from, with paths}}. This file is the loop's
-memory and its stop switch: `/loop --until '~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate {{LEDGER_FILE}}'`
-stops only when the line above reads `STATUS: DONE`, no `- [ ]` is left, every `- [x]` carries
-`DONE:`/`INVALID:` evidence and every `- [!]` a `BLOCKED:` reason.
+memory and its stop switch: the gate `~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate {{LEDGER_FILE}}`
+(run by `/seref_manager run {{LEDGER_FILE}}` or `/loop --until`) stops the loop only when the line
+above reads `STATUS: DONE`, no `- [ ]` is left, every `- [x]` carries `DONE:`/`INVALID:` evidence and
+every `- [!]` a `BLOCKED:` reason.
 
 ## Protocol (every iteration)
 
@@ -21,9 +22,13 @@ stops only when the line above reads `STATUS: DONE`, no `- [ ]` is left, every `
    Back up any DB before a schema change or backfill.
 6. Edit this file: `- [ ]` -> `- [x]` and append ` — DONE: <files>; <test/smoke evidence>`.
    One item per iteration is fine; finish an item completely or leave it `- [ ]`.
-7. Blocked only for a user decision (ask with the `ask` tool first) or an unreachable host/credential:
+7. Blocked only for a user decision or an unreachable host/credential. For a decision, call the `ask`
+   tool; nobody may be at the keyboard, so under `/seref_manager` the loop manager answers it or
+   tells you to defer. Never end a turn waiting for a reply. Mark a blocker
    `- [!] … — BLOCKED: <exact missing thing, what was tried>`. Difficulty, size or scope pressure
    is not a blocker.
+   A `— MANAGER(itN): …` note is the loop manager's review: an item it reopened stays open until
+   you fix what the note names and tick it again with new evidence.
 8. When no `- [ ]` is left: run every test suite and {{FINAL CHECK}}, replace the STATUS line with
    `STATUS: DONE`, append a summary (done / invalid / blocked) at the bottom, then run the gate
    command above. It must exit 0; if it does not, fix what its message names before yielding.

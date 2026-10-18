@@ -49,13 +49,22 @@ Write it in this order:
 2. The command to paste, as a fenced block. Use a limit of about twice the item count; ITEMS
    below is that number.
    ```
+   /seref_manager run LOOP_<SLUG>.md --max <ITEMS>
+   ```
+   Then, on its own line, the manager-less fallback for sessions without the seref_manager
+   extension (running `/seref_manager run` on the ledger later audits whatever this fallback
+   ticked):
+   ```
    /loop <ITEMS> --until '~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate LOOP_<SLUG>.md' Read LOOP_<SLUG>.md and follow its Protocol exactly: take the first "- [ ]" item, re-check that the finding still holds, fix it at the root, verify with tests plus a real smoke run, deploy only within the allowed windows, then mark it "- [x] ... — DONE: <evidence>". When no "- [ ]" is left, run every suite and the final check, set "STATUS: DONE", add the summary, and confirm the gate exits 0.
    ```
-3. How the stop works, briefly:
-   - The loop ends only when the gate exits 0.
-   - A DONE claim with open or unproven items is rejected and the loop keeps going.
-   - A missing or broken ledger stops the loop with an error.
-   - Esc pauses the loop; `/loop` again turns it off.
+3. How the run works, briefly:
+   - The loop ends only when the gate exits 0. A DONE claim with open or unproven items is
+     rejected and the loop keeps going; a missing or broken ledger stops it with an error.
+   - After each iteration the manager reviews it: reopens ticks the transcript does not back,
+     rejects weak blockers, answers questions, steers the next iteration, compacts when useful,
+     and stops the loop as stuck when only the user can unblock it.
+   - `ask` dialogs get 2 minutes for you, then the manager answers or defers them
+     (`--grace SECONDS`, or `/seref_manager away` to skip the wait).
+   - Esc pauses; `/seref_manager resume` continues, `/seref_manager stop` ends it. Decisions are
+     logged to `LOOP_<SLUG>.manager.md`.
 4. The default choices you made (from step 2) and any risks.
-5. For more than ~15 items: suggest setting `loop.mode` to `compact` or `reset`. The ledger is the
-   memory, so fresh context each iteration is safe.

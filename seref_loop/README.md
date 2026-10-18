@@ -14,7 +14,7 @@ flowchart TD
   A["/seref_loop goal"] --> B["Verify findings yourself<br/>(code, live data, scouts)"]
   B --> C["LOOP_SLUG.md ledger<br/>protocol + atomic items"]
   C --> D["gate must exit 1"]
-  D --> E["user pastes the /loop line"]
+  D --> E["user pastes /seref_manager run"]
   E --> F["iteration: first '- [ ]' item<br/>fix, test, smoke, deploy, tick with evidence"]
   F --> G{"seref-loop-gate"}
   G -->|"1: open or premature DONE"| F
@@ -28,19 +28,27 @@ flowchart TD
    - It writes `LOOP_<SLUG>.md` at the repo root from `templates/LEDGER.md`: a project-specific
      protocol (tests, smoke hosts, deploy windows, backups, commit policy) and one line per atomic
      item with file:line, evidence, fix direction and an acceptance check.
-   - It runs the gate (it must exit 1) and replies with the exact `/loop` line to paste, plus the
+   - It runs the gate (it must exit 1) and replies with the exact command to paste, plus the
      default decisions it made, so you can veto them first.
-2. **Run (`/loop N --until '…/seref-loop-gate LOOP_<SLUG>.md' <iteration prompt>`)**:
+2. **Run (`/seref_manager run LOOP_<SLUG>.md --max N`)**, driven by
+   [seref_manager](../seref_manager/README.md):
    - Each iteration takes the first `- [ ]`, re-checks it, fixes it, verifies it, and marks it
      `- [x] … — DONE: <evidence>`. Wrong findings become `INVALID:`. Real blockers become
      `- [!] … — BLOCKED: <reason>`.
    - When nothing is open, the agent runs every suite and writes `STATUS: DONE`. That is how it
      claims done.
-   - `N` caps the iterations as a backstop. Esc pauses; `/loop` again turns it off.
+   - Between iterations the manager model reviews the transcript, reopens ticks it doesn't back
+     (`— MANAGER(itN): reopened: …`), answers the worker's questions, and steers the next
+     iteration. The gate alone decides done.
+   - `N` caps the iterations as a backstop. Esc pauses; `/seref_manager resume` continues.
+   - Without the extension, the reply's `/loop N --until '…/seref-loop-gate LOOP_<SLUG>.md' …`
+     line runs the same ledger with no manager. Switching to `/seref_manager run` later (after
+     turning `/loop` off) audits the ticks made without it before continuing.
 
 ## The gate (`bin/seref-loop-gate [LEDGER]`)
 
-`/loop --until` stops on exit 0, runs again on 1, and stops with an error on anything else.
+The gate runs after every iteration (`/seref_manager`, or `/loop --until`): exit 0 stops, 1 runs
+again, anything else stops with an error.
 
 | Ledger state | Exit | Loop |
 |---|---|---|
@@ -74,7 +82,8 @@ live in `templates/LEDGER.md`, which is copied, not rendered.
 
 ## Tips
 
-- For more than ~15 items, set `loop.mode` to `compact` or `reset` in omp's settings. The
-  ledger carries all state, so a fresh context each iteration is safe and stays fast.
+- With the `/loop` fallback and more than ~15 items, set `loop.mode` to `compact` or `reset`. The
+  ledger carries all state, so a fresh context each iteration is safe. `/seref_manager` decides
+  compaction per iteration instead.
 - One ledger per goal. Keep it at the repo root next to the code it fixes; delete it after the
   loop ends (the gate treats a missing ledger as an error, so not while it runs).
