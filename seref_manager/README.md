@@ -6,8 +6,9 @@ prompt until a shell check passes, and an `ask` dialog during an overnight run w
 worker actually did and decides how the next iteration starts, and it answers `ask` dialogs that
 nobody answers.
 
-It does not use omp's `judge` role. The manager is an ordinary chat model call, by default the
-session's model, with its own prompts (`extension/prompts/`).
+It does not use omp's `judge` role. The manager is an ordinary chat model call with its own
+prompts (`extension/prompts/`): the `seref_manager` model role if you configure one, else the
+session's model.
 
 ## How it works
 
@@ -22,12 +23,13 @@ flowchart TD
   S -->|"no"| M["manager reviews the iteration"]
   M -->|"stuck / item reopened 3x"| X
   M -->|"reopen, unblock, answers, guidance"| L["ledger edits + notes"]
-  L -->|"compact if chosen"| W
+  L -->|"keep / compact / fresh session"| W
 ```
 
 After each worker yield:
 
-1. **Gate.** `seref-loop-gate LOOP_X.md`: exit 0 ends the loop as done, 2 ends it with the error.
+1. **Gate.** `seref-loop-gate LOOP_X.md`: exit 2 ends the loop with the error. Exit 0 ends it as
+   done, unless the final iteration changed items and the manager reopens one of them on review.
 2. **Hard stops.** The iteration limit (`--max`, default twice the item count, at least 5), or 2
    iterations in a row that change no item state and no STATUS line.
 3. **Review.** The manager model gets the ledger, the items that changed state, the gate summary,
@@ -38,7 +40,8 @@ After each worker yield:
    - `unblock`: `[!]` items whose reason is difficulty or size → `- [ ] … — MANAGER(itN): blocker rejected: …`.
    - `answers`: questions the worker left in its final text, answered or explicitly deferred.
    - `guidance`: instructions for the next iteration.
-   - `context`: `compact` runs omp's compaction before the next prompt.
+   - `context`: `keep` the conversation, `compact` it, or `reset` to a fresh session (the worker
+     then has only the ledger and the manager's notes). `--context` can fix this instead.
    - `verdict`: `stuck` stops the loop. There is no `done`; the manager cannot finish the loop.
 4. **Next iteration.** The worker prompt (`extension/prompts/worker.md`) plus the manager's notes.
 
@@ -49,7 +52,7 @@ pause the loop.
 ### `ask` while the loop runs
 
 On the first `run` in a session, the extension takes over the built-in `ask` tool, keeping its
-schema and description:
+schema, description and TUI rendering:
 
 - No loop, or the loop is paused: it runs the native `ask` unchanged.
 - Loop running: the native dialog opens and you get `--grace` seconds (default 120) to answer.
@@ -66,20 +69,43 @@ Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
 
 | Command | What |
 |---|---|
-| `/seref_manager run <LOOP_X.md> [--max N] [--grace S] [--model SPEC[:effort]] [--away]` | start; the gate must exit 1 |
+| `/seref_manager run <LOOP_X.md> [--max N] [--grace S] [--model SPEC[:effort]] [--context manager\|keep\|compact\|reset] [--away]` | start; the gate must exit 1 |
 | `/seref_manager pause` / `resume` | pause after the current turn / continue (re-reviews the last iteration) |
 | `/seref_manager stop` | end the loop |
 | `/seref_manager away [on\|off]` | toggle answering `ask` without the grace period |
-| `/seref_manager status` | iteration, item counts, recent manager decisions, log path |
+| `/seref_manager status` | iteration, item counts, manager model, recent decisions, log path |
 
-Esc during a worker turn pauses the loop. `--model` takes anything `--model` takes in omp
-(`provider/id`, a bare id, `@role`), with an optional `:effort` suffix (default `medium`).
+Esc during a worker turn pauses the loop. `--context` defaults to `manager` (the manager picks
+per iteration); `reset` gives every iteration a fresh session, like `loop.mode: reset`.
+
+### Manager model and cost
+
+Each iteration costs one manager call, plus one per `ask` it answers. Resolution order:
+
+1. `--model SPEC[:effort]`: anything omp's `--model` takes (`provider/id`, a bare id, `@role`).
+2. The `seref_manager` model role, e.g. in `~/.omp/agent/config.yml`:
+   ```yaml
+   modelRoles:
+     seref_manager: anthropic/claude-haiku-4-5
+   ```
+3. The session's model.
+
+Effort is `medium` unless `--model` ends in `:effort`; a thinking suffix on the role is ignored.
+
+### Restarts and session switches
+
+Loop state is saved in the session (custom `seref_manager_state` entries, invisible to the
+model) after every change. Resuming that session (`omp -c`, `--resume`, `/resume`) restores the
+loop paused; `/seref_manager resume` re-reviews the interrupted iteration and continues. Leaving
+the session (`/new`, `/resume` elsewhere) detaches the loop without ending it. With
+`--context reset` each iteration is its own session file, linked through `parentSession`; the
+newest one carries the state.
 
 ## Install / test
 
 ```bash
 ./install.sh     # links extension/ to ~/.omp/agent/extensions/seref_manager; restart omp
-bun test         # ledger edits (against the real gate), reply parsing, transcript digest
+bun test         # ledger edits (against the real gate), reply parsing, transcript digest, state restore
 ```
 
 The gate is found at `../seref_loop/bin/seref-loop-gate`, relative to this repo's real path;
@@ -87,9 +113,7 @@ set `SEREF_LOOP_GATE` to use another one.
 
 ## Limits
 
-- Loop state lives in memory: restarting omp or switching sessions ends the loop. The ledger
-  holds all progress, so `/seref_manager run` again picks up where it stopped.
-- There is no `reset` (fresh session per iteration); extensions cannot start a new session from
-  the loop's event handlers. `compact` is the context control.
 - The manager reviews only items that changed state in the iteration it sees. An unproven tick
   from an earlier run is not re-checked.
+- After an omp restart the loop needs one `/seref_manager resume`: starting a fresh session
+  needs a command context, and only a command provides one.

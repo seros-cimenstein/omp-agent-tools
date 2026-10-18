@@ -11,7 +11,7 @@ export interface IterationVerdict {
 	edits: LedgerEdit[];
 	answers: { question: string; answer: string }[];
 	guidance: string;
-	context: "keep" | "compact";
+	context: "keep" | "compact" | "reset";
 }
 
 export interface AskQuestion {
@@ -74,7 +74,9 @@ export function parseIterationVerdict(text: string): IterationVerdict {
 	const verdict = raw.verdict;
 	if (verdict !== "continue" && verdict !== "stuck") throw new Error(`"verdict" must be "continue" or "stuck"`);
 	const context = raw.context ?? "keep";
-	if (context !== "keep" && context !== "compact") throw new Error(`"context" must be "keep" or "compact"`);
+	if (context !== "keep" && context !== "compact" && context !== "reset") {
+		throw new Error(`"context" must be "keep", "compact" or "reset"`);
+	}
 	const edits: LedgerEdit[] = [];
 	for (const [key, kind] of [
 		["reopen", "reopen"],

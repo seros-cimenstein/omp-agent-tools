@@ -33,7 +33,8 @@ describe("parseIterationVerdict", () => {
 
 	test("rejects malformed entries instead of applying part of them", () => {
 		expect(() => parseIterationVerdict('{"verdict": "continue", "reopen": [{"id": "A1"}]}')).toThrow(/reason/);
-		expect(() => parseIterationVerdict('{"verdict": "continue", "context": "reset"}')).toThrow(/context/);
+		expect(() => parseIterationVerdict('{"verdict": "continue", "context": "restart"}')).toThrow(/context/);
+		expect(parseIterationVerdict('{"verdict": "continue", "context": "reset"}').context).toBe("reset");
 	});
 });
 

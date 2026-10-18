@@ -11,9 +11,13 @@ export type ManagerEffort = (typeof EFFORTS)[number];
 const TIMEOUT_MS = 5 * 60_000;
 const MAX_TOKENS = 16_000;
 
+/** Optional model role users can set in config.yml (`modelRoles.seref_manager`) for a cheaper manager. */
+const MANAGER_ROLE = "@seref_manager";
+
 /**
- * Resolve `spec` (`provider/id`, bare id, `@role`, optional `:effort` suffix) or, without
- * one, the session's current model. Throws when nothing matches.
+ * Resolve `spec` (`provider/id`, bare id, `@role`, optional `:effort` suffix). Without one: the
+ * `seref_manager` model role when configured, else the session's current model. Throws when
+ * nothing matches.
  */
 export function resolveManagerModel(
 	ctx: ExtensionContext,
@@ -21,9 +25,9 @@ export function resolveManagerModel(
 	fallbackEffort: ManagerEffort,
 ): { model: Model; effort: ManagerEffort } {
 	if (!spec) {
-		const current = ctx.models.current();
-		if (!current) throw new Error("the session has no model; pass --model");
-		return { model: current, effort: fallbackEffort };
+		const model = ctx.models.resolve(MANAGER_ROLE) ?? ctx.models.current();
+		if (!model) throw new Error("the session has no model; pass --model");
+		return { model, effort: fallbackEffort };
 	}
 	const suffix = /:([a-z]+)$/.exec(spec);
 	const effort = EFFORTS.find(candidate => candidate === suffix?.[1]);

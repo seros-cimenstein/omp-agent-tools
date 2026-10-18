@@ -4,15 +4,27 @@
  * `/seref_manager run LOOP_X.md` drives the loop itself instead of omp's `/loop`: after every
  * worker yield it runs the seref-loop gate (the only way to finish), then asks the manager
  * model to review the iteration — reopen unproven ticks, reject weak blockers, answer
- * questions the worker left in text, write guidance, choose compaction, or stop as stuck —
- * and sends the next iteration prompt. While the loop runs it also answers the worker's
- * `ask` calls when nobody answers the dialog within the grace period.
+ * questions the worker left in text, write guidance, choose keep/compact/reset, or stop as
+ * stuck — and sends the next iteration prompt. While the loop runs it also answers the
+ * worker's `ask` calls when nobody answers the dialog within the grace period.
+ *
+ * Loop state is saved into the session after every change and restored (paused) when the
+ * session is resumed, so an omp restart does not lose the loop.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { askToolRenderer } from "@oh-my-pi/pi-tui/tools/ask";
 import { applyEdits, changedItems, countItems, type LedgerItem, type LedgerSnapshot, parseLedger, progressKey } from "./ledger";
-import { callManager, type ManagerEffort, resolveManagerModel } from "./model";
+import { callManager, EFFORTS, type ManagerEffort, resolveManagerModel } from "./model";
+import {
+	CONTEXT_POLICIES,
+	type ContextPolicy,
+	latestPersistedEntry,
+	type PersistedEntry,
+	type PersistedLoop,
+	STATE_ENTRY_TYPE,
+} from "./state";
 import { digestIteration, lastAssistant } from "./transcript";
 import { type AskAnswer, type AskQuestion, type IterationVerdict, parseAskAnswers, parseIterationVerdict } from "./verdict";
 
@@ -42,32 +54,30 @@ const GATE_TIMEOUT_MS = 30_000;
 const IDLE_POLL_MS = 250;
 const IDLE_POLL_LIMIT = 120;
 
+/** The native ask renderer; `mergeCallAndResult` is not in ToolDefinition's type but is forwarded at runtime. */
+const ASK_RENDERING = {
+	renderCall: askToolRenderer.renderCall,
+	renderResult: askToolRenderer.renderResult,
+	describeCall: askToolRenderer.describeCall,
+	describeResult: askToolRenderer.describeResult,
+	mergeCallAndResult: true,
+};
+
 const USAGE = [
-	"/seref_manager run <LOOP_X.md> [--max N] [--grace SECONDS] [--model SPEC[:effort]] [--away]",
+	"/seref_manager run <LOOP_X.md> [--max N] [--grace SECONDS] [--model SPEC[:effort]] [--context manager|keep|compact|reset] [--away]",
 	"/seref_manager pause | resume | stop | status | away [on|off]",
 ].join("\n");
 
-interface LoopState {
-	ledgerPath: string;
-	logPath: string;
-	cwd: string;
-	iteration: number;
-	max: number;
-	graceMs: number;
-	away: boolean;
-	/** Whether `ask` exists (and is shadowed) in this session; decides the worker prompt's decision line. */
-	askAvailable: boolean;
-	modelSpec: string | undefined;
+interface LoopState extends PersistedLoop {
 	effort: ManagerEffort;
 	paused: boolean;
 	busy: boolean;
-	/** Session leaf just before the current iteration's prompt; the iteration's transcript starts after it. */
-	startLeafId: string | null;
-	startSnapshot: LedgerSnapshot;
-	noProgress: number;
-	reopenCounts: Map<string, number>;
-	managerFailures: number;
-	history: string[];
+	/** Set while the loop itself starts a fresh session, so its `session_switch` is not mistaken for the user's. */
+	resetting: boolean;
+	/** From the last `run`/`resume`; the only context that can start a new session. */
+	commandCtx: ExtensionCommandContext | undefined;
+	/** Whether `ask` exists (and is shadowed) in this session; decides the worker prompt's decision line. */
+	askAvailable: boolean;
 	/** Aborted on pause/stop so an in-flight manager call ends. */
 	abort: AbortController;
 }
@@ -77,11 +87,12 @@ interface RunArgs {
 	max?: number;
 	graceSeconds?: number;
 	model?: string;
+	context: ContextPolicy;
 	away: boolean;
 }
 
 function parseRunArgs(tokens: string[]): RunArgs {
-	const args: RunArgs = { ledger: "", away: false };
+	const args: RunArgs = { ledger: "", context: "manager", away: false };
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
 		const value = (): string => {
@@ -98,7 +109,12 @@ function parseRunArgs(tokens: string[]): RunArgs {
 		else if (token === "--grace") args.graceSeconds = count(value(), 0);
 		else if (token === "--model") args.model = value();
 		else if (token === "--away") args.away = true;
-		else if (token.startsWith("--")) throw new Error(`unknown flag ${token}`);
+		else if (token === "--context") {
+			const policy = value();
+			const match = CONTEXT_POLICIES.find(candidate => candidate === policy);
+			if (!match) throw new Error(`--context takes ${CONTEXT_POLICIES.join(", ")}`);
+			args.context = match;
+		} else if (token.startsWith("--")) throw new Error(`unknown flag ${token}`);
 		else if (args.ledger) throw new Error(`unexpected argument ${token}`);
 		else args.ledger = token;
 	}
@@ -115,14 +131,44 @@ function displayPath(cwd: string, file: string): string {
 	return relative && !relative.startsWith("..") ? relative : file;
 }
 
+/** The audit log next to the ledger: `LOOP_X.md` → `LOOP_X.manager.md`. */
+function logPathFor(ledgerPath: string): string {
+	return ledgerPath.replace(/(\.md)?$/, ".manager.md");
+}
+
+function toPersisted(loop: LoopState): PersistedLoop {
+	return {
+		ledgerPath: loop.ledgerPath,
+		cwd: loop.cwd,
+		iteration: loop.iteration,
+		max: loop.max,
+		graceMs: loop.graceMs,
+		away: loop.away,
+		modelSpec: loop.modelSpec,
+		effort: loop.effort,
+		contextPolicy: loop.contextPolicy,
+		startLeafId: loop.startLeafId,
+		startSnapshot: loop.startSnapshot,
+		noProgress: loop.noProgress,
+		reopenCounts: loop.reopenCounts,
+		managerFailures: loop.managerFailures,
+		history: loop.history,
+	};
+}
+
 export default function serefManager(pi: ExtensionAPI): void {
 	let state: LoopState | undefined;
 	let askShadowed = false;
 	let askQueue: Promise<unknown> = Promise.resolve();
 
+	const persist = (loop: LoopState | undefined): void => {
+		const entry: PersistedEntry = { version: 1, loop: loop ? toPersisted(loop) : null };
+		pi.appendEntry(STATE_ENTRY_TYPE, entry);
+	};
+
 	const log = (loop: LoopState, markdown: string): void => {
 		try {
-			fs.appendFileSync(loop.logPath, `${markdown.trimEnd()}\n\n`);
+			fs.appendFileSync(logPathFor(loop.ledgerPath), `${markdown.trimEnd()}\n\n`);
 		} catch {
 			// The audit log is best effort; the ledger and the session hold the real state.
 		}
@@ -147,6 +193,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		if (!loop) return;
 		state = undefined;
 		loop.abort.abort();
+		persist(undefined);
 		log(loop, `## Loop ended after iteration ${loop.iteration}\n\n${message}`);
 		updateStatus(ctx);
 		ctx.ui.notify(`seref_manager: ${message}`, level);
@@ -158,6 +205,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		loop.paused = true;
 		loop.abort.abort();
 		loop.abort = new AbortController();
+		persist(loop);
 		updateStatus(ctx);
 		ctx.ui.notify(`seref_manager: ${message}`, "warning");
 	};
@@ -172,6 +220,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		loop.iteration++;
 		loop.startLeafId = ctx.sessionManager.getLeafId();
 		loop.startSnapshot = snapshot;
+		persist(loop);
 		let prompt = PROMPT_WORKER.replaceAll("{{iteration}}", String(loop.iteration))
 			.replaceAll("{{max}}", String(loop.max))
 			.replaceAll("{{ledger}}", displayPath(loop.cwd, loop.ledgerPath))
@@ -191,16 +240,23 @@ export default function serefManager(pi: ExtensionAPI): void {
 		gatePassed: boolean,
 	): Promise<IterationVerdict | undefined> => {
 		const target = resolveManagerModel(ctx, loop.modelSpec, loop.effort);
+		const usage = ctx.getContextUsage();
 		const input = [
 			`# Iteration ${loop.iteration} of ${loop.max}`,
 			gatePassed
 				? `Gate: ${gateSummary}. The gate passes: the loop ends now unless you reopen or unblock an item.`
 				: `Gate: ${gateSummary}`,
+			usage && usage.contextWindow > 0
+				? `Worker context: ${Math.round((usage.tokens / usage.contextWindow) * 100)}% of ${usage.contextWindow} tokens.`
+				: "",
+			loop.contextPolicy === "manager" ? "" : `Context policy is fixed to "${loop.contextPolicy}"; your "context" choice is ignored.`,
 			`## Items whose state changed this iteration\n${changes.length > 0 ? changes.map(change => `${change.item.line}  (was ${change.from ?? "absent"})`).join("\n") : "(none)"}`,
 			`## Your earlier decisions\n${loop.history.length > 0 ? loop.history.join("\n") : "(none)"}`,
 			`## Ledger (${displayPath(loop.cwd, loop.ledgerPath)})\n${ledgerText}`,
 			`## Transcript of iteration ${loop.iteration}\n${digestIteration(ctx.sessionManager.getBranch(), loop.startLeafId, ITERATION_DIGEST_CHARS) || "(empty)"}`,
-		].join("\n\n");
+		]
+			.filter(Boolean)
+			.join("\n\n");
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
@@ -230,9 +286,35 @@ export default function serefManager(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * One iteration boundary: gate → stop rules → manager review → ledger edits → (compact) → next
-	 * prompt. A passing gate still gets a review when the iteration changed items, so the final
-	 * ticks and blockers are checked like any other; the loop then ends unless the manager reopened one.
+	 * Start the next iteration in a fresh session. Only a command context can do that, so the
+	 * loop keeps the one from the last `run`/`resume`. Returns false when the loop must not go on.
+	 */
+	const resetSession = async (ctx: ExtensionContext, loop: LoopState): Promise<boolean> => {
+		const command = loop.commandCtx;
+		if (!command) {
+			ctx.ui.notify("seref_manager: no command context to start a new session; compacting instead", "warning");
+			await ctx.compact({ suppressContinuation: true });
+			return state === loop && !loop.paused;
+		}
+		loop.resetting = true;
+		try {
+			const result = await command.newSession({ parentSession: ctx.sessionManager.getSessionFile() });
+			if (result.cancelled) {
+				pause(ctx, "starting a fresh session was cancelled; loop paused.");
+				return false;
+			}
+		} finally {
+			loop.resetting = false;
+		}
+		log(loop, `Fresh session for iteration ${loop.iteration + 1}: ${ctx.sessionManager.getSessionFile() ?? "(in memory)"}`);
+		return state === loop && !loop.paused;
+	};
+
+	/**
+	 * One iteration boundary: gate → stop rules → manager review → ledger edits → context
+	 * (keep/compact/reset) → next prompt. A passing gate still gets a review when the iteration
+	 * changed items, so the final ticks and blockers are checked like any other; the loop then
+	 * ends unless the manager reopened one.
 	 */
 	const advance = async (ctx: ExtensionContext): Promise<void> => {
 		const loop = state;
@@ -272,7 +354,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 					snapshot = parseLedger(edited.text);
 				}
 				for (const edit of edited.applied) {
-					if (edit.kind === "reopen") loop.reopenCounts.set(edit.id, (loop.reopenCounts.get(edit.id) ?? 0) + 1);
+					if (edit.kind === "reopen") loop.reopenCounts[edit.id] = (loop.reopenCounts[edit.id] ?? 0) + 1;
 					notes.push(`- ${edit.id} ${edit.kind === "reopen" ? "was reopened" : "blocker was rejected"}: ${edit.reason}`);
 				}
 				for (const answer of verdict.answers) notes.push(`- Your question "${answer.question}": ${answer.answer}`);
@@ -281,7 +363,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 					`it${loop.iteration}: ${verdict.verdict}, ${verdict.reason}`,
 					edited.applied.length > 0 ? `edited ${edited.applied.map(edit => `${edit.id} (${edit.kind})`).join(", ")}` : "",
 					verdict.answers.length > 0 ? `answered ${verdict.answers.length} question(s)` : "",
-					verdict.context === "compact" ? "compacted" : "",
+					verdict.context === "keep" ? "" : verdict.context,
 				]
 					.filter(Boolean)
 					.join("; ");
@@ -295,7 +377,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 						...edited.skipped.map(skip => `- skipped ${skip.edit.kind} ${skip.edit.id}: ${skip.why}`),
 						...verdict.answers.map(answer => `- Q: ${answer.question}\n  A: ${answer.answer}`),
 						verdict.guidance ? `Guidance: ${verdict.guidance}` : "",
-						`Context: ${verdict.context}`,
+						`Context: ${verdict.context}${loop.contextPolicy === "manager" ? "" : ` (policy: ${loop.contextPolicy})`}`,
 					]
 						.filter(Boolean)
 						.join("\n"),
@@ -304,19 +386,23 @@ export default function serefManager(pi: ExtensionAPI): void {
 				if (loop.iteration >= loop.max) {
 					return finish(ctx, `iteration limit ${loop.max} reached after the manager reopened items.`, "warning");
 				}
-				const overReopened = [...loop.reopenCounts].find(([, count]) => count >= REOPEN_LIMIT);
+				const overReopened = Object.entries(loop.reopenCounts).find(([, count]) => count >= REOPEN_LIMIT);
 				if (overReopened) {
 					return finish(ctx, `stuck: ${overReopened[0]} was reopened ${overReopened[1]} times. Check its evidence yourself.`, "warning");
 				}
 				if (verdict.verdict === "stuck") return finish(ctx, `stuck: ${verdict.reason}`, "warning");
-				if (verdict.context === "compact") {
-					try {
-						await ctx.compact({ suppressContinuation: true });
-					} catch (error) {
-						ctx.ui.notify(`seref_manager: compaction failed (${errorText(error)}); continuing uncompacted`, "warning");
-					}
-					if (state !== loop || loop.paused) return;
+			}
+
+			const contextAction = loop.contextPolicy === "manager" ? (verdict?.context ?? "keep") : loop.contextPolicy;
+			if (contextAction === "compact") {
+				try {
+					await ctx.compact({ suppressContinuation: true });
+				} catch (error) {
+					ctx.ui.notify(`seref_manager: compaction failed (${errorText(error)}); continuing uncompacted`, "warning");
 				}
+				if (state !== loop || loop.paused) return;
+			} else if (contextAction === "reset" && !(await resetSession(ctx, loop))) {
+				return;
 			}
 			startIteration(ctx, loop, snapshot, notes);
 		} catch (error) {
@@ -406,9 +492,10 @@ export default function serefManager(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Shadow the built-in `ask` with the native schema and description. Outside an active loop it
-	 * delegates unchanged; inside one, the native dialog gets `graceMs` before the manager answers.
-	 * Registered on the first `run`, so sessions that never use the loop are untouched.
+	 * Shadow the built-in `ask` with the native schema, description and renderer. Outside an
+	 * active loop it delegates unchanged; inside one, the native dialog gets `graceMs` before the
+	 * manager answers. Registered on the first `run` or restore, so sessions that never use the
+	 * loop are untouched.
 	 */
 	const shadowAsk = (): boolean => {
 		if (askShadowed) return true;
@@ -420,6 +507,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			description: native.description,
 			parameters: native.parameters,
 			approval: "read",
+			...ASK_RENDERING,
 			async execute(_toolCallId, params, signal, onUpdate, ctx) {
 				const run = askQueue.then(async () => {
 					const loop = state;
@@ -463,36 +551,62 @@ export default function serefManager(pi: ExtensionAPI): void {
 		return true;
 	};
 
-	const startRun = async (ctx: ExtensionContext, tokens: string[]): Promise<void> => {
+	/** Bring back a loop saved in the current session, paused, so nothing runs until `resume`. */
+	const restore = (ctx: ExtensionContext): void => {
+		if (state || ctx.agent.kind !== "main") return;
+		const saved = latestPersistedEntry(ctx.sessionManager.getBranch())?.loop;
+		if (!saved) return;
+		if (!fs.existsSync(saved.ledgerPath)) {
+			ctx.ui.notify(`seref_manager: this session had a loop on ${saved.ledgerPath}, but the ledger is gone; not restored`, "warning");
+			return;
+		}
+		state = {
+			...saved,
+			effort: EFFORTS.find(effort => effort === saved.effort) ?? DEFAULT_EFFORT,
+			paused: true,
+			busy: false,
+			resetting: false,
+			commandCtx: undefined,
+			askAvailable: shadowAsk(),
+			abort: new AbortController(),
+		};
+		updateStatus(ctx);
+		ctx.ui.notify(
+			`seref_manager: restored the loop on ${displayPath(ctx.cwd, saved.ledgerPath)} at iteration ${saved.iteration}/${saved.max}, paused. /seref_manager resume continues, /seref_manager stop ends it.`,
+			"info",
+		);
+	};
+
+	const startRun = async (ctx: ExtensionCommandContext, tokens: string[]): Promise<void> => {
 		if (state) throw new Error(`a loop is already running on ${displayPath(ctx.cwd, state.ledgerPath)}; /seref_manager stop first`);
 		const args = parseRunArgs(tokens);
 		const ledgerPath = path.resolve(ctx.cwd, args.ledger.replace(/^~(?=\/)/, process.env.HOME ?? "~"));
 		if (!fs.existsSync(ledgerPath)) throw new Error(`no ledger at ${ledgerPath}`);
 		if (!fs.existsSync(GATE)) throw new Error(`gate not found at ${GATE} (set SEREF_LOOP_GATE)`);
-		resolveManagerModel(ctx, args.model, DEFAULT_EFFORT);
+		const target = resolveManagerModel(ctx, args.model, DEFAULT_EFFORT);
 
-		const ledgerText = await Bun.file(ledgerPath).text();
-		const snapshot = parseLedger(ledgerText);
-		const counts = countItems(snapshot);
+		const snapshot = parseLedger(await Bun.file(ledgerPath).text());
 		const loop: LoopState = {
 			ledgerPath,
-			logPath: ledgerPath.replace(/(\.md)?$/, ".manager.md"),
 			cwd: ctx.cwd,
 			iteration: 0,
-			max: args.max ?? Math.max(MIN_DEFAULT_MAX, counts.total * 2),
+			max: args.max ?? Math.max(MIN_DEFAULT_MAX, countItems(snapshot).total * 2),
 			graceMs: (args.graceSeconds ?? DEFAULT_GRACE_SECONDS) * 1000,
 			away: args.away,
-			askAvailable: false,
 			modelSpec: args.model,
-			effort: DEFAULT_EFFORT,
-			paused: false,
-			busy: false,
+			effort: target.effort,
+			contextPolicy: args.context,
 			startLeafId: null,
 			startSnapshot: snapshot,
 			noProgress: 0,
-			reopenCounts: new Map(),
+			reopenCounts: {},
 			managerFailures: 0,
 			history: [],
+			paused: false,
+			busy: false,
+			resetting: false,
+			commandCtx: ctx,
+			askAvailable: false,
 			abort: new AbortController(),
 		};
 		const gate = await runGate(loop);
@@ -505,12 +619,16 @@ export default function serefManager(pi: ExtensionAPI): void {
 		const askNote = loop.askAvailable
 			? `ask answered after ${loop.away ? 0 : loop.graceMs / 1000}s`
 			: "no ask tool in this session";
+		const modelName = `${target.model.provider}/${target.model.id}:${target.effort}`;
 		state = loop;
 		log(
 			loop,
-			`# seref_manager run (${new Date().toISOString()})\n\nLedger: ${ledgerPath}\nMax iterations: ${loop.max}\nManager model: ${args.model ?? "session model"}\nStart: ${gate.summary}`,
+			`# seref_manager run (${new Date().toISOString()})\n\nLedger: ${ledgerPath}\nMax iterations: ${loop.max}\nManager model: ${modelName}\nContext: ${loop.contextPolicy}\nStart: ${gate.summary}`,
 		);
-		ctx.ui.notify(`seref_manager: running ${displayPath(ctx.cwd, ledgerPath)}, max ${loop.max} iterations, ${askNote}. ${gate.summary}`, "info");
+		ctx.ui.notify(
+			`seref_manager: running ${displayPath(ctx.cwd, ledgerPath)}, max ${loop.max} iterations, manager ${modelName}, context ${loop.contextPolicy}, ${askNote}. ${gate.summary}`,
+			"info",
+		);
 		startIteration(ctx, loop, snapshot, []);
 	};
 
@@ -537,6 +655,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 						if (!loop) throw new Error("no loop is running");
 						if (!loop.paused) throw new Error("the loop is not paused");
 						loop.paused = false;
+						loop.commandCtx = ctx;
+						persist(loop);
 						updateStatus(ctx);
 						ctx.ui.notify("seref_manager: resumed", "info");
 						void advance(ctx);
@@ -552,6 +672,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 						const mode = rest[0];
 						if (mode !== undefined && mode !== "on" && mode !== "off") throw new Error("away takes on or off");
 						loop.away = mode === undefined ? !loop.away : mode === "on";
+						persist(loop);
 						updateStatus(ctx);
 						ctx.ui.notify(
 							`seref_manager: away ${loop.away ? "on: ask goes straight to the manager" : `off: ask waits ${loop.graceMs / 1000}s for you`}`,
@@ -566,12 +687,14 @@ export default function serefManager(pi: ExtensionAPI): void {
 							return;
 						}
 						const counts = countItems(loop.startSnapshot);
+						const target = resolveManagerModel(ctx, loop.modelSpec, loop.effort);
 						ctx.ui.notify(
 							[
 								`seref_manager: ${displayPath(ctx.cwd, loop.ledgerPath)}, iteration ${loop.iteration}/${loop.max}${loop.paused ? " (paused)" : ""}`,
 								`${counts.done} done, ${counts.blocked} blocked, ${counts.open} open of ${counts.total}`,
-								`ask: ${loop.away ? "manager answers at once" : `manager answers after ${loop.graceMs / 1000}s`}; model: ${loop.modelSpec ?? "session model"}`,
-								`log: ${displayPath(ctx.cwd, loop.logPath)}`,
+								`manager: ${target.model.provider}/${target.model.id}:${target.effort}; context: ${loop.contextPolicy}`,
+								`ask: ${loop.away ? "manager answers at once" : `manager answers after ${loop.graceMs / 1000}s`}`,
+								`log: ${displayPath(ctx.cwd, logPathFor(loop.ledgerPath))}`,
 								...loop.history,
 							].join("\n"),
 							"info",
@@ -602,8 +725,19 @@ export default function serefManager(pi: ExtensionAPI): void {
 		ctx.setTimeout(() => advance(ctx), 0);
 	});
 
+	pi.on("session_start", (_event, ctx) => restore(ctx));
+
 	pi.on("session_switch", (_event, ctx) => {
-		if (state) finish(ctx, "session switched; loop stopped.", "warning");
+		const loop = state;
+		if (loop?.resetting) return;
+		if (loop) {
+			// The loop stays saved in the session it ran in; resuming that session restores it.
+			loop.abort.abort();
+			state = undefined;
+			updateStatus(ctx);
+			ctx.ui.notify(`seref_manager: left the session running the loop on ${displayPath(ctx.cwd, loop.ledgerPath)}; resume that session to continue it.`, "warning");
+		}
+		restore(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
