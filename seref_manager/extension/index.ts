@@ -15,6 +15,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgRetryWaitForUsageReset } from "@oh-my-pi/pi-coding-agent/session/settings";
+import { classifyMessage, Flag, is } from "@oh-my-pi/pi-ai/error";
+import { extractProviderRetryHint } from "@oh-my-pi/pi-ai/utils/retry-after";
 import { askToolRenderer } from "@oh-my-pi/pi-tui/tools/ask";
 import {
 	applyEdits,
@@ -42,6 +45,7 @@ import {
 	type PersistedLoop,
 	STATE_ENTRY_TYPE,
 } from "./state";
+import { chooseResumeAt, findUsageLimit, formatClock, ompWaitFromFinalError, type QuotaError } from "./quota";
 import { digestIteration, lastAssistant } from "./transcript";
 import { ledgerCommands, MANAGER_TOOLS, runManagerTool } from "./tools";
 import {
@@ -81,6 +85,12 @@ const IDLE_POLL_LIMIT = 120;
 /** Tool calls the audit may make; a full suite run usually covers many items at once. */
 const AUDIT_TOOL_CALLS = 60;
 const AUDIT_TIMEOUT_MS = 30 * 60_000;
+/** Longest single timer while waiting for a usage reset; the wait re-arms until it is due. */
+const QUOTA_TIMER_MAX_MS = 60 * 60_000;
+/** omp's own give-up message about a usage limit counts for the stop that follows within this long. */
+const OMP_GIVE_UP_FRESH_MS = 2 * 60_000;
+const QUOTA_RESUME_PROMPT =
+	"The provider's usage limit stopped this iteration and has reset now. Continue the iteration where it stopped: re-read the ledger if you need to, finish the current item, verify it and tick it with evidence.";
 
 /** The native ask renderer; `mergeCallAndResult` is not in ToolDefinition's type but is forwarded at runtime. */
 const ASK_RENDERING = {
@@ -107,6 +117,19 @@ interface LoopState extends PersistedLoop {
 	askAvailable: boolean;
 	/** Aborted on pause/stop so an in-flight manager call ends. */
 	abort: AbortController;
+	/** Wakes the loop when a usage-limit wait is due; not persisted (re-armed on restore). */
+	quotaTimer: Timer | undefined;
+}
+
+/** The usage-limit error in `value` (failed message or Error cause chain), by omp's own classifier. */
+function usageLimitError(value: unknown): QuotaError | undefined {
+	return findUsageLimit(value, fields => is(classifyMessage(fields), Flag.UsageLimit));
+}
+
+/** Milliseconds the provider asked to wait (`retry-after-ms=`, "try again in ~N min", "resets at …"). */
+function providerHintMs(error: QuotaError): number | undefined {
+	const hint = extractProviderRetryHint(error.provider, error.errorMessage);
+	return hint !== undefined && hint > 0 ? hint : undefined;
 }
 
 interface RunArgs {
@@ -185,6 +208,8 @@ function toPersisted(loop: LoopState): PersistedLoop {
 		managerFailures: loop.managerFailures,
 		history: loop.history,
 		audited: loop.audited,
+		quotaWait: loop.quotaWait,
+		paused: loop.paused,
 	};
 }
 
@@ -205,6 +230,32 @@ export default function serefManager(pi: ExtensionAPI): void {
 	/** Every prompt the user typed this process, to recognize a resubmission of one. */
 	const everTyped = new Set<string>();
 	let lastSentPrompt: string | undefined;
+	/** Set while this extension holds `retry.waitForUsageReset` on for a running loop. */
+	let holdingUsageWaits = false;
+	/** omp's last give-up on a usage limit (`auto_retry_end`), for the stop that follows it. */
+	let ompGiveUp: { waitMs: number; at: number } | undefined;
+
+	/**
+	 * While a loop runs, let omp itself sleep through usage limits it knows the reset time of
+	 * (`retry.waitForUsageReset`), so the worker's turn simply continues afterwards. Runtime-only:
+	 * never written to config.yml, released when the loop ends. A configured `true` is left alone.
+	 */
+	const holdUsageWaits = (): void => {
+		if (!settings || holdingUsageWaits || cfgRetryWaitForUsageReset.get(settings)) return;
+		cfgRetryWaitForUsageReset.override(settings, true);
+		holdingUsageWaits = true;
+	};
+
+	const releaseUsageWaits = (): void => {
+		if (!settings || !holdingUsageWaits) return;
+		cfgRetryWaitForUsageReset.clearOverride(settings);
+		holdingUsageWaits = false;
+	};
+
+	const clearQuotaTimer = (ctx: ExtensionContext, loop: LoopState): void => {
+		if (loop.quotaTimer) ctx.clearTimer(loop.quotaTimer);
+		loop.quotaTimer = undefined;
+	};
 
 	const persist = (loop: LoopState | undefined): void => {
 		const entry: PersistedEntry = { version: 1, loop: loop ? toPersisted(loop) : null };
@@ -226,11 +277,126 @@ export default function serefManager(pi: ExtensionAPI): void {
 			return;
 		}
 		const counts = countItems(loop.startSnapshot);
-		const flags = [loop.paused ? "paused" : "", loop.away ? "away" : ""].filter(Boolean).join(" · ");
+		const flags = [
+			loop.paused ? "paused" : "",
+			loop.quotaWait ? `usage limit, resumes ${formatClock(loop.quotaWait.until, Date.now())}` : "",
+			loop.away ? "away" : "",
+		]
+			.filter(Boolean)
+			.join(" · ");
 		ctx.ui.setStatus(
 			"seref_manager",
 			`seref ${loop.iteration}/${loop.max} · ${counts.done} done ${counts.blocked} blocked ${counts.open} open${flags ? ` · ${flags}` : ""}`,
 		);
+	};
+
+	/** Usage health of the account pool behind `provider`/`model`, from omp's usage reports and credential blocks. */
+	const usageHealth = async (
+		ctx: ExtensionContext,
+		provider: string,
+		model: string,
+	): Promise<{ state: string; resets: number[] }> => {
+		try {
+			const health = await ctx.modelRegistry.authStorage.health.model(provider, {
+				modelId: model,
+				sessionId: ctx.sessionManager.getSessionId(),
+				reserveFraction: 0,
+				signal: AbortSignal.timeout(20_000),
+			});
+			const resets = health.accounts.flatMap(account =>
+				account.state === "depleted" && account.resetsAt !== undefined ? [account.resetsAt] : [],
+			);
+			return { state: health.state, resets };
+		} catch {
+			return { state: "unknown", resets: [] };
+		}
+	};
+
+	const armQuotaTimer = (ctx: ExtensionContext, loop: LoopState): void => {
+		clearQuotaTimer(ctx, loop);
+		const wait = loop.quotaWait;
+		if (!wait) return;
+		const delay = Math.max(1_000, Math.min(wait.until - Date.now(), QUOTA_TIMER_MAX_MS));
+		loop.quotaTimer = ctx.setTimeout(() => {
+			loop.quotaTimer = undefined;
+			if (state !== loop || loop.paused || loop.quotaWait !== wait) return;
+			if (Date.now() < wait.until) armQuotaTimer(ctx, loop);
+			else void wakeFromQuota(ctx, loop, false);
+		}, delay);
+	};
+
+	/**
+	 * Stop driving the loop until the usage limit that `phase` hit resets: compute when (usage
+	 * report, provider hint, omp's estimate, else a 30-minute probe), save it, and arm a timer.
+	 * Not a failure: no counter moves, and the iteration resumes where it stopped.
+	 */
+	const enterQuotaWait = async (
+		ctx: ExtensionContext,
+		loop: LoopState,
+		phase: "worker" | "manager" | "audit",
+		error: QuotaError,
+	): Promise<void> => {
+		const current = ctx.models.current();
+		const provider = error.provider ?? current?.provider ?? "unknown";
+		const model = error.model ?? current?.id ?? "unknown";
+		const health = await usageHealth(ctx, provider, model);
+		if (state !== loop || loop.paused) return;
+		const now = Date.now();
+		const ompWaitMs = phase === "worker" && ompGiveUp && now - ompGiveUp.at < OMP_GIVE_UP_FRESH_MS ? ompGiveUp.waitMs : undefined;
+		const { at, source } = chooseResumeAt({ now, accountResets: health.resets, hintMs: providerHintMs(error), ompWaitMs });
+		loop.quotaWait = { until: at, phase, provider, model, source };
+		persist(loop);
+		updateStatus(ctx);
+		const who = phase === "worker" ? "the worker" : phase === "manager" ? "the manager's review" : "the audit";
+		log(
+			loop,
+			`## Usage limit (${who}, iteration ${loop.iteration})\n\n${provider}/${model}: ${error.errorMessage ?? "usage limit"}\nResumes ${new Date(at).toISOString()} (${source}).`,
+		);
+		ctx.ui.notify(
+			`seref_manager: ${provider}/${model} hit its usage limit during ${who}. Waiting until ${formatClock(at, now)} (${source}), then the loop continues by itself. /seref_manager resume tries now, /seref_manager stop ends the loop.`,
+			"warning",
+		);
+		armQuotaTimer(ctx, loop);
+	};
+
+	/** The wait is due (or `force`d by `resume`): re-check the account, then continue what stopped. */
+	const wakeFromQuota = async (ctx: ExtensionContext, loop: LoopState, force: boolean): Promise<void> => {
+		const wait = loop.quotaWait;
+		if (!wait || state !== loop) return;
+		if (!force) {
+			const health = await usageHealth(ctx, wait.provider, wait.model);
+			if (state !== loop || loop.paused || loop.quotaWait !== wait) return;
+			const later = health.state === "depleted" ? health.resets.filter(reset => reset > Date.now() + 60_000) : [];
+			if (later.length > 0) {
+				loop.quotaWait = { ...wait, until: Math.min(...later) + 60_000, source: "usage report" };
+				persist(loop);
+				updateStatus(ctx);
+				log(loop, `Usage limit still exhausted; next try ${new Date(loop.quotaWait.until).toISOString()}.`);
+				armQuotaTimer(ctx, loop);
+				return;
+			}
+		}
+		if (!ctx.isIdle()) {
+			// Someone is using the session right now; try again in a minute.
+			loop.quotaWait = { ...wait, until: Date.now() + 60_000 };
+			armQuotaTimer(ctx, loop);
+			return;
+		}
+		loop.quotaWait = undefined;
+		clearQuotaTimer(ctx, loop);
+		persist(loop);
+		updateStatus(ctx);
+		log(loop, `Usage limit wait over; resuming ${wait.phase === "worker" ? `iteration ${loop.iteration}` : wait.phase}.`);
+		ctx.ui.notify(`seref_manager: usage limit wait over (${wait.provider}/${wait.model}); continuing.`, "info");
+		if (wait.phase === "worker") {
+			const prompt = `[seref_manager · iteration ${loop.iteration}/${loop.max}] ${QUOTA_RESUME_PROMPT}`;
+			lastSentPrompt = prompt;
+			pi.sendUserMessage(prompt, { attribution: "agent" });
+		} else if (wait.phase === "manager") {
+			void advance(ctx);
+		} else {
+			void auditThenStart(ctx, loop);
+		}
 	};
 
 	const finish = (ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void => {
@@ -238,6 +404,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 		if (!loop) return;
 		state = undefined;
 		loop.abort.abort();
+		clearQuotaTimer(ctx, loop);
+		releaseUsageWaits();
 		persist(undefined);
 		log(loop, `## Loop ended after iteration ${loop.iteration}\n\n${message}`);
 		updateStatus(ctx);
@@ -250,6 +418,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		loop.paused = true;
 		loop.abort.abort();
 		loop.abort = new AbortController();
+		clearQuotaTimer(ctx, loop);
 		persist(loop);
 		updateStatus(ctx);
 		ctx.ui.notify(`seref_manager: ${message}`, "warning");
@@ -313,7 +482,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 				loop.managerFailures = 0;
 				return verdict;
 			} catch (error) {
-				if (loop.abort.signal.aborted) throw error;
+				// A usage limit is not the manager failing: advance() turns it into a wait.
+				if (loop.abort.signal.aborted || usageLimitError(error)) throw error;
 				lastError = error;
 			}
 		}
@@ -367,7 +537,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 	 */
 	const advance = async (ctx: ExtensionContext): Promise<void> => {
 		const loop = state;
-		if (!loop || loop.paused || loop.busy) return;
+		if (!loop || loop.paused || loop.busy || loop.quotaWait) return;
 		loop.busy = true;
 		try {
 			// Queued user messages run first; their own agent_end brings us back here.
@@ -383,15 +553,17 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const after = parseLedger(ledgerText);
 			const changes = changedItems(loop.startSnapshot, after);
 			if (gatePassed && changes.length === 0) return finish(ctx, done, "info");
-			loop.noProgress = progressKey(after) === progressKey(loop.startSnapshot) ? loop.noProgress + 1 : 0;
+			// Counted only once the review is through: a review retried after a usage limit is the same iteration.
+			const noProgress = progressKey(after) === progressKey(loop.startSnapshot) ? loop.noProgress + 1 : 0;
 			if (!gatePassed && loop.iteration >= loop.max) {
 				return finish(ctx, `iteration limit ${loop.max} reached (${gate.summary}).`, "warning");
 			}
-			if (!gatePassed && loop.noProgress >= NO_PROGRESS_LIMIT) {
-				return finish(ctx, `stuck: ${loop.noProgress} iterations without any ledger change (${gate.summary}).`, "warning");
+			if (!gatePassed && noProgress >= NO_PROGRESS_LIMIT) {
+				return finish(ctx, `stuck: ${noProgress} iterations without any ledger change (${gate.summary}).`, "warning");
 			}
 
 			const verdict = await reviewIteration(ctx, loop, ledgerText, changes, gate.summary, gatePassed);
+			loop.noProgress = noProgress;
 			if (state !== loop || loop.paused) return;
 			if (gatePassed && !verdict) return finish(ctx, done, "info");
 			const notes: string[] = [];
@@ -455,7 +627,9 @@ export default function serefManager(pi: ExtensionAPI): void {
 			}
 			startIteration(ctx, loop, snapshot, notes);
 		} catch (error) {
-			if (state === loop && !loop.paused) pause(ctx, `${errorText(error)}. Loop paused; /seref_manager resume retries.`);
+			const quota = usageLimitError(error);
+			if (quota && state === loop && !loop.paused) void enterQuotaWait(ctx, loop, "manager", quota);
+			else if (state === loop && !loop.paused) pause(ctx, `${errorText(error)}. Loop paused; /seref_manager resume retries.`);
 		} finally {
 			loop.busy = false;
 		}
@@ -494,17 +668,13 @@ export default function serefManager(pi: ExtensionAPI): void {
 		}
 
 		if (!answers) {
+			const quota = usageLimitError(failure);
 			log(loop, `## Iteration ${loop.iteration}: ask unanswered (manager failed: ${errorText(failure)})`);
 			ctx.ui.notify(`seref_manager: could not answer ask (${errorText(failure)})`, "warning");
-			return {
-				content: [
-					{
-						type: "text",
-						text: `Nobody is at the keyboard and the loop manager could not answer (${errorText(failure)}). Take the conservative default, record the choice in the item's evidence, and continue.`,
-					},
-				],
-				details: {},
-			};
+			const text = quota
+				? `Nobody is at the keyboard and the loop manager is out of its usage limit, so this is not decided. Mark the current item "- [!] … — BLOCKED: awaiting user: <your question>" and continue with the next open item.`
+				: `Nobody is at the keyboard and the loop manager could not answer (${errorText(failure)}). Take the conservative default, record the choice in the item's evidence, and continue.`;
+			return { content: [{ type: "text", text }], details: {} };
 		}
 
 		const lines = answers.map(answer => {
@@ -609,16 +779,29 @@ export default function serefManager(pi: ExtensionAPI): void {
 			ctx.ui.notify(`seref_manager: this session had a loop on ${saved.ledgerPath}, but the ledger is gone; not restored`, "warning");
 			return;
 		}
+		// A loop that was waiting out a usage limit keeps waiting and continues by itself;
+		// anything else comes back paused until `resume`.
+		const waiting = saved.quotaWait !== undefined && !saved.paused;
 		state = {
 			...saved,
-			paused: true,
+			paused: !waiting,
 			busy: false,
 			resetting: false,
 			commandCtx: undefined,
 			askAvailable: shadowAsk(),
 			abort: new AbortController(),
+			quotaTimer: undefined,
 		};
 		updateStatus(ctx);
+		if (waiting && saved.quotaWait) {
+			holdUsageWaits();
+			armQuotaTimer(ctx, state);
+			ctx.ui.notify(
+				`seref_manager: restored the loop on ${displayPath(ctx.cwd, saved.ledgerPath)} at iteration ${saved.iteration}/${saved.max}; it is waiting for the ${saved.quotaWait.provider} usage limit and continues by itself at ${formatClock(saved.quotaWait.until, Date.now())}. /seref_manager pause holds it, /seref_manager stop ends it.`,
+				"info",
+			);
+			return;
+		}
 		ctx.ui.notify(
 			`seref_manager: restored the loop on ${displayPath(ctx.cwd, saved.ledgerPath)} at iteration ${saved.iteration}/${saved.max}, paused. /seref_manager resume continues, /seref_manager stop ends it.`,
 			"info",
@@ -726,7 +909,9 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (gate.code !== 1) return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error");
 			startIteration(ctx, loop, parseLedger(await Bun.file(loop.ledgerPath).text()), notes);
 		} catch (error) {
-			if (state === loop && !loop.paused) {
+			const quota = usageLimitError(error);
+			if (quota && state === loop && !loop.paused) void enterQuotaWait(ctx, loop, "audit", quota);
+			else if (state === loop && !loop.paused) {
 				pause(ctx, `audit failed: ${errorText(error)}. /seref_manager resume retries it; run with --no-audit to skip it.`);
 			}
 		}
@@ -766,12 +951,14 @@ export default function serefManager(pi: ExtensionAPI): void {
 			managerFailures: 0,
 			history: [],
 			audited: !audit,
+			quotaWait: undefined,
 			paused: false,
 			busy: false,
 			resetting: false,
 			commandCtx: ctx,
 			askAvailable: false,
 			abort: new AbortController(),
+			quotaTimer: undefined,
 		};
 		const gate = await runGate(loop);
 		if (gate.code !== 0 && gate.code !== 1) throw new Error(`gate exit ${gate.code}: ${gate.summary}`);
@@ -780,6 +967,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			return;
 		}
 		loop.askAvailable = shadowAsk();
+		holdUsageWaits();
 		const askNote = loop.askAvailable
 			? `ask answered after ${loop.away ? 0 : loop.graceMs / 1000}s`
 			: "no ask tool in this session";
@@ -824,9 +1012,15 @@ export default function serefManager(pi: ExtensionAPI): void {
 					case "resume": {
 						const loop = state;
 						if (!loop) throw new Error("no loop is running");
-						if (!loop.paused) throw new Error("the loop is not paused");
+						if (!loop.paused && !loop.quotaWait) throw new Error("the loop is not paused");
 						loop.paused = false;
 						loop.commandCtx = ctx;
+						holdUsageWaits();
+						if (loop.quotaWait) {
+							ctx.ui.notify("seref_manager: resumed; trying now instead of waiting for the usage limit reset", "info");
+							void wakeFromQuota(ctx, loop, true);
+							return;
+						}
 						persist(loop);
 						updateStatus(ctx);
 						ctx.ui.notify("seref_manager: resumed", "info");
@@ -866,6 +1060,9 @@ export default function serefManager(pi: ExtensionAPI): void {
 								`${counts.done} done, ${counts.blocked} blocked, ${counts.open} open of ${counts.total}`,
 								`manager: ${describeTarget(target)}; context: ${loop.contextPolicy}`,
 								`ask: ${loop.away ? "manager answers at once" : `manager answers after ${loop.graceMs / 1000}s`}`,
+								loop.quotaWait
+									? `usage limit: ${loop.quotaWait.provider}/${loop.quotaWait.model} hit it during the ${loop.quotaWait.phase}; continues at ${formatClock(loop.quotaWait.until, Date.now())} (${loop.quotaWait.source})`
+									: "",
 								`log: ${displayPath(ctx.cwd, logPathFor(loop.ledgerPath))}`,
 								...loop.history,
 							].join("\n"),
@@ -924,13 +1121,18 @@ export default function serefManager(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", (event, ctx) => {
 		const loop = state;
-		if (!loop || loop.paused || event.willContinue) return;
+		if (!loop || loop.paused || loop.quotaWait || event.willContinue) return;
 		const last = lastAssistant(event.messages);
 		if (last?.stopReason === "aborted") {
 			pause(ctx, "interrupted, loop paused. /seref_manager resume continues, /seref_manager stop ends it.");
 			return;
 		}
 		if (last?.stopReason === "error") {
+			const quota = usageLimitError(last.message);
+			if (quota) {
+				void enterQuotaWait(ctx, loop, "worker", quota);
+				return;
+			}
 			pause(ctx, "the worker's turn ended with an error, loop paused. /seref_manager resume retries.");
 			return;
 		}
@@ -949,11 +1151,29 @@ export default function serefManager(pi: ExtensionAPI): void {
 		if (loop) {
 			// The loop stays saved in the session it ran in; resuming that session restores it.
 			loop.abort.abort();
+			clearQuotaTimer(ctx, loop);
+			releaseUsageWaits();
 			state = undefined;
 			updateStatus(ctx);
 			ctx.ui.notify(`seref_manager: left the session running the loop on ${displayPath(ctx.cwd, loop.ledgerPath)}; resume that session to continue it.`, "warning");
 		}
 		restore(ctx);
+	});
+
+	// omp sleeping through a usage limit itself (retry.waitForUsageReset): show it on the status line.
+	pi.on("auto_retry_start", (event, ctx) => {
+		const loop = state;
+		if (!loop || event.delayMs < 60_000 || !usageLimitError({ errorMessage: event.errorMessage, errorId: event.errorId })) return;
+		const until = formatClock(Date.now() + event.delayMs, Date.now());
+		ctx.ui.setStatus("seref_manager", `seref ${loop.iteration}/${loop.max} · usage limit, omp retries at ${until}`);
+		log(loop, `omp is waiting out a usage limit inside iteration ${loop.iteration}; it retries at ${new Date(Date.now() + event.delayMs).toISOString()}.`);
+	});
+
+	// omp giving up on a usage limit: remember its estimate for the stop that follows.
+	pi.on("auto_retry_end", (event, ctx) => {
+		if (state) updateStatus(ctx);
+		const waitMs = event.success ? undefined : ompWaitFromFinalError(event.finalError);
+		ompGiveUp = waitMs !== undefined ? { waitMs, at: Date.now() } : undefined;
 	});
 
 	pi.on("session_shutdown", () => {

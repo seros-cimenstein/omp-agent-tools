@@ -139,21 +139,48 @@ omp's loop state, so seref_manager tracks it from what reaches extensions:
 - If omp's loop resubmits a prompt during a seref_manager run anyway, the run pauses and says so:
   type `/loop` to turn it off, then `/seref_manager resume`.
 
+### Usage limits (quota)
+
+When a provider's usage limit runs out (Claude's 5-hour or weekly window, a Codex limit, a spend
+cap), the loop waits for the reset and then continues by itself. Short per-minute throttles are not
+usage limits; omp's own retry handles those inside the turn.
+
+1. **omp waits inside the turn when it knows the reset time.** While a loop runs, seref_manager turns
+   on omp's `retry.waitForUsageReset` (runtime only, never written to config.yml, released when the
+   loop ends). When omp knows the reset time from the provider or its usage report, it sleeps until
+   then and the worker's turn just continues. The status line shows `usage limit, omp retries at
+   HH:MM`; Esc cancels omp's wait.
+2. **Otherwise seref_manager waits.** When the worker's turn, the manager's review or the audit ends
+   on a usage limit, the loop does not pause or count a failure. It picks the next attempt from, in
+   order: the earliest account reset in omp's usage reports, the provider's "try again in"/
+   `retry-after` hint or omp's own estimate, else a probe 30 minutes out, plus one minute of margin.
+   The status line shows `usage limit, resumes HH:MM`. When the time comes it re-checks the usage
+   report (and waits longer if the account is still exhausted), then continues what stopped: the
+   worker gets a prompt to finish the interrupted iteration, or the review or audit runs again.
+3. **The wait survives a restart.** It is saved with the loop, so resuming the session (`omp -c`)
+   re-arms it instead of restoring the loop paused.
+
+`/seref_manager resume` tries right away instead of waiting; `pause` and `stop` work as usual. An
+`ask` that the manager cannot answer because of its own usage limit is deferred (the worker marks
+the item `BLOCKED: awaiting user:` and moves on). Every wait and its source go to
+`LOOP_X.manager.md`.
+
 ### Restarts and session switches
 
 Loop state is saved in the session (custom `seref_manager_state` entries, invisible to the
 model) after every change. Resuming that session (`omp -c`, `--resume`, `/resume`) restores the
-loop paused; `/seref_manager resume` re-reviews the interrupted iteration and continues. Leaving
-the session (`/new`, `/resume` elsewhere) detaches the loop without ending it. With
-`--context reset` each iteration is its own session file, linked through `parentSession`; the
-newest one carries the state.
+loop paused, unless it was waiting out a usage limit, in which case it keeps waiting and continues
+by itself. `/seref_manager resume` re-reviews the interrupted iteration and continues. Leaving the
+session (`/new`, `/resume` elsewhere) detaches the loop without ending it. With `--context reset`
+each iteration is its own session file, linked through `parentSession`; the newest one carries
+the state.
 
 ## Install / test
 
 ```bash
 ./install.sh     # links extension/ to ~/.omp/agent/extensions/seref_manager; restart omp
 bun test         # ledger edits (against the real gate), ledger discovery, reply parsing, transcript
-                 # digest, state restore, tool safety (allowlist, denylist, repo confinement)
+                 # digest, state restore, tool safety, usage-limit detection and resume timing
 ```
 
 The gate is found at `../seref_loop/bin/seref-loop-gate`, relative to this repo's real path;

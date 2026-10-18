@@ -90,7 +90,7 @@ export async function callManager(
 		},
 	);
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
-		throw new Error(`manager model ${message.stopReason}: ${message.errorMessage ?? "no detail"}`);
+		throw new Error(`manager model ${message.stopReason}: ${message.errorMessage ?? "no detail"}`, { cause: message });
 	}
 	const text = message.content.flatMap(block => (block.type === "text" ? [block.text] : [])).join("");
 	if (!text.trim()) throw new Error("manager model returned no text");
@@ -145,7 +145,7 @@ export async function callManagerWithTools(
 			},
 		);
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
-			throw new Error(`manager model ${message.stopReason}: ${message.errorMessage ?? "no detail"}`);
+			throw new Error(`manager model ${message.stopReason}: ${message.errorMessage ?? "no detail"}`, { cause: message });
 		}
 		messages.push(message);
 		const toolCalls = message.content.flatMap(block => (block.type === "toolCall" ? [block] : []));

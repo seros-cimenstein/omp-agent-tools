@@ -29,6 +29,32 @@ export interface PersistedLoop {
 	history: string[];
 	/** False until the start-of-run audit of unsupervised ticks finished (or was skipped). */
 	audited: boolean;
+	/** Set while the loop waits for a provider usage limit to reset. */
+	quotaWait: QuotaWait | undefined;
+	/** Paused by the user or an error; a restored loop is paused unless it was waiting out a usage limit. */
+	paused: boolean;
+}
+
+const QUOTA_PHASES = ["worker", "manager", "audit"] as const;
+
+/** A usage-limit pause: what hit the limit, and when to try again. */
+export interface QuotaWait {
+	/** Epoch ms of the next attempt. */
+	until: number;
+	/** What hit the limit and resumes afterwards: the worker's turn, the manager's review, or the audit. */
+	phase: (typeof QUOTA_PHASES)[number];
+	provider: string;
+	model: string;
+	/** How `until` was chosen (usage report, provider hint, …). */
+	source: string;
+}
+
+function parseQuotaWait(raw: unknown): QuotaWait | undefined {
+	if (!isRecord(raw)) return undefined;
+	const phase = QUOTA_PHASES.find(candidate => candidate === raw.phase);
+	if (!phase || typeof raw.until !== "number" || !Number.isFinite(raw.until)) return undefined;
+	if (typeof raw.provider !== "string" || typeof raw.model !== "string" || typeof raw.source !== "string") return undefined;
+	return { until: raw.until, phase, provider: raw.provider, model: raw.model, source: raw.source };
 }
 
 /** What one state entry records: the loop, or `null` once it ended. */
@@ -92,6 +118,8 @@ export function parsePersistedEntry(data: unknown): PersistedEntry | undefined {
 			history: loop.history,
 			// Entries from before the audit existed belong to loops that were already running.
 			audited: loop.audited !== false,
+			quotaWait: parseQuotaWait(loop.quotaWait),
+			paused: loop.paused === true,
 		},
 	};
 }

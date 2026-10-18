@@ -86,12 +86,14 @@ export function digestIteration(entries: readonly unknown[], startLeafId: string
 	return `${full.slice(0, head)}\n\n… [${full.length - maxChars} chars of the middle of this iteration cut] …\n\n${full.slice(-(maxChars - head))}`;
 }
 
-/** Text of the last assistant message in an `agent_end` message list. */
-export function lastAssistant(messages: readonly unknown[]): { text: string; stopReason: unknown } | undefined {
+/** The last assistant message in an `agent_end` message list, its text, and how it stopped. */
+export function lastAssistant(
+	messages: readonly unknown[],
+): { text: string; stopReason: unknown; message: Record<string, unknown> } | undefined {
 	for (let index = messages.length - 1; index >= 0; index--) {
 		const message = messages[index];
 		if (isRecord(message) && message.role === "assistant") {
-			return { text: contentText(message.content), stopReason: message.stopReason };
+			return { text: contentText(message.content), stopReason: message.stopReason, message };
 		}
 	}
 	return undefined;
