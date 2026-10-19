@@ -33,6 +33,8 @@ export interface PersistedLoop {
 	quotaWait: QuotaWait | undefined;
 	/** Paused by the user or an error; a restored loop is paused unless it was waiting out a usage limit. */
 	paused: boolean;
+	/** This loop's own ntfy topic (`<project>-<random>`), kept across restarts. */
+	ntfyTopic: string | undefined;
 }
 
 const QUOTA_PHASES = ["worker", "manager", "audit"] as const;
@@ -120,6 +122,7 @@ export function parsePersistedEntry(data: unknown): PersistedEntry | undefined {
 			audited: loop.audited !== false,
 			quotaWait: parseQuotaWait(loop.quotaWait),
 			paused: loop.paused === true,
+			ntfyTopic: typeof loop.ntfyTopic === "string" && loop.ntfyTopic ? loop.ntfyTopic : undefined,
 		},
 	};
 }

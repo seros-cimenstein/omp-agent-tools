@@ -12,6 +12,7 @@
  * session is resumed, so an omp restart does not lose the loop.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -55,7 +56,17 @@ import {
 	type QuotaError,
 	type RoleUsage,
 } from "./quota";
-import { loadNtfyConfig, NTFY_CONFIG_PATH, type NtfyPriority, sendNtfy } from "./notify";
+import {
+	cancelNtfy,
+	loadNtfyConfig,
+	NTFY_CONFIG_PATH,
+	type NtfyConfig,
+	NtfyOutbox,
+	ntfyQuotaLine,
+	type NtfyPriority,
+	perLoopTopic,
+	publishNtfy,
+} from "./notify";
 import { digestIteration, lastAssistant } from "./transcript";
 import { ledgerCommands, MANAGER_TOOLS, runManagerTool } from "./tools";
 import {
@@ -129,6 +140,22 @@ interface LoopState extends PersistedLoop {
 	abort: AbortController;
 	/** Wakes the loop when a usage-limit wait is due; not persisted (re-armed on restore). */
 	quotaTimer: Timer | undefined;
+	/** Checks for stalls and pushes the offline alert back once a minute while the loop exists. */
+	watchdog: Timer | undefined;
+	/** Last sign of work: a model token, tool output, turn boundary or loop step. */
+	lastActivity: number;
+	/** A manager call in flight (review, ask answer, audit) and since when. */
+	managerBusy: { kind: "review" | "ask" | "audit"; since: number } | undefined;
+	/** Stalls already reported, so each is reported once (and its recovery once). */
+	stalls: Set<"worker" | "manager" | "idle" | "requests">;
+	/** When the offline alert was last pushed back; undefined = none scheduled. */
+	offlinePushedAt: number | undefined;
+	/** Since when pushing the offline alert has been failing (the network, or ntfy, is unreachable). */
+	offlineFailingSince: number | undefined;
+	/** omp is sleeping through a usage limit inside the turn until then; not a stall. */
+	ompWaitUntil: number | undefined;
+	/** Offline-alert pushes and cancels, in order. */
+	offlineChain: Promise<void>;
 }
 
 /** The usage-limit error in `value` (failed message or Error cause chain), by omp's own classifier. */
@@ -213,6 +240,23 @@ function logPathFor(ledgerPath: string): string {
 	return ledgerPath.replace(/(\.md)?$/, ".manager.md");
 }
 
+/** Watchdog state of a loop that starts or is restored now. */
+function freshWatch(): Pick<
+	LoopState,
+	"watchdog" | "lastActivity" | "managerBusy" | "stalls" | "offlinePushedAt" | "offlineFailingSince" | "ompWaitUntil" | "offlineChain"
+> {
+	return {
+		watchdog: undefined,
+		lastActivity: Date.now(),
+		managerBusy: undefined,
+		stalls: new Set(),
+		offlinePushedAt: undefined,
+		offlineFailingSince: undefined,
+		ompWaitUntil: undefined,
+		offlineChain: Promise.resolve(),
+	};
+}
+
 function toPersisted(loop: LoopState): PersistedLoop {
 	return {
 		ledgerPath: loop.ledgerPath,
@@ -232,6 +276,7 @@ function toPersisted(loop: LoopState): PersistedLoop {
 		audited: loop.audited,
 		quotaWait: loop.quotaWait,
 		paused: loop.paused,
+		ntfyTopic: loop.ntfyTopic,
 	};
 }
 
@@ -252,6 +297,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 	/** Every prompt the user typed this process, to recognize a resubmission of one. */
 	const everTyped = new Set<string>();
 	let lastSentPrompt: string | undefined;
+	/** Phone messages that could not be delivered yet (network down, rate limit), sent with the next one that works. */
+	const outbox = new NtfyOutbox();
 	/** Set while this extension holds `retry.waitForUsageReset` on for a running loop. */
 	let holdingUsageWaits = false;
 	/** omp's last give-up on a usage limit (`auto_retry_end`), for the stop that follows it. */
@@ -473,17 +520,173 @@ export default function serefManager(pi: ExtensionAPI): void {
 		}
 	};
 
+	/** Where a loop's messages go: its own topic, or the general one when `perLoop` is off. */
+	const loopTopic = (config: NtfyConfig, loop: LoopState): string => (config.perLoop && loop.ntfyTopic) || config.topic;
+
 	/**
-	 * Push one event to the phone through ntfy, titled with the project (the ledger's directory) and
-	 * ledger. Config is re-read each time, so editing it applies at once; no config, no message.
+	 * Push one event to the phone through ntfy, into the loop's own topic, titled with the project
+	 * (the ledger's directory) and ledger. Config is re-read each time, so edits apply at once; no
+	 * config, no message. Never shown in omp's chat.
 	 */
 	const phone = (loop: LoopState, priority: NtfyPriority, tags: string[], message: string): void => {
 		const config = loadNtfyConfig();
 		if (!config) return;
 		const title = `${path.basename(path.dirname(loop.ledgerPath))} · ${path.basename(loop.ledgerPath)} · it ${loop.iteration}/${loop.max}`;
-		void sendNtfy(config, { title, message, priority, tags }).then(failure => {
-			if (failure) log(loop, `ntfy notification failed: ${failure}`);
+		void outbox.send(config, loopTopic(config, loop), { title, message, priority, tags }).then(failure => {
+			if (failure) log(loop, `ntfy notification failed (kept for later): ${failure}`);
 		});
+	};
+
+	/** Announce a new loop on the general channel with the topic to subscribe to for it. */
+	const announceLoop = (loop: LoopState, summary: string): void => {
+		const config = loadNtfyConfig();
+		if (!config?.perLoop || !loop.ntfyTopic) return;
+		const project = path.basename(path.dirname(loop.ledgerPath));
+		void outbox.send(config, config.topic, {
+			title: `${project}: new seref loop`,
+			message: `${project} · ${path.basename(loop.ledgerPath)} started on ${os.hostname()} (${summary}). Subscribe to ${loop.ntfyTopic} for its progress.`,
+			priority: 3,
+			tags: ["new"],
+			click: `${config.server}/${loop.ntfyTopic}`,
+		});
+	};
+
+	const OFFLINE_SEQUENCE = "seref-offline";
+
+	/** Run offline-alert operations one after another, so a cancel can never overtake a push in flight. */
+	const offlineOp = (loop: LoopState, op: () => Promise<void>): Promise<void> => {
+		const next = loop.offlineChain.then(op, op);
+		loop.offlineChain = next.catch(() => undefined);
+		return next;
+	};
+
+	/**
+	 * The dead man's switch: (re)schedule the offline alert on the ntfy server `offlineMinutes`
+	 * ahead, at most every half of that. While omp lives it never arrives; when omp dies, the
+	 * machine sleeps or the network drops, the pushes stop and the server delivers it.
+	 */
+	const pushOfflineAlert = (loop: LoopState): void => {
+		const config = loadNtfyConfig();
+		if (!config || config.offlineMinutes === 0) return;
+		const now = Date.now();
+		if (loop.offlinePushedAt !== undefined && now - loop.offlinePushedAt < (config.offlineMinutes * 60_000) / 2) return;
+		loop.offlinePushedAt = now;
+		const project = path.basename(path.dirname(loop.ledgerPath));
+		void offlineOp(loop, async () => {
+			// Queued behind a cancel for a loop that ended or paused meanwhile: nothing to push.
+			if (state !== loop || loop.paused) return;
+			const failure = await publishNtfy(config, loopTopic(config, loop), {
+				title: `${project} · ${path.basename(loop.ledgerPath)}: no sign of life`,
+				message: `No sign of life from omp on ${os.hostname()} for ${config.offlineMinutes} min, last at ${new Date(now).toTimeString().slice(0, 5)}: omp crashed or was closed without stopping the loop, the machine is asleep or off, or its network is down. Last known: iteration ${loop.iteration}/${loop.max}.`,
+				priority: 4,
+				tags: ["skull"],
+				sequenceId: OFFLINE_SEQUENCE,
+				delay: `${config.offlineMinutes}m`,
+			});
+			if (failure) {
+				loop.offlinePushedAt = undefined;
+				loop.offlineFailingSince ??= now;
+				return;
+			}
+			const since = loop.offlineFailingSince;
+			loop.offlineFailingSince = undefined;
+			if (since !== undefined && now - since > 5 * 60_000) {
+				phone(loop, 3, ["signal_strength"], `Back online: ntfy was unreachable from ${new Date(since).toTimeString().slice(0, 5)} (the offline alert may have fired meanwhile).`);
+			}
+		});
+	};
+
+	/**
+	 * Drop the scheduled offline alert: the loop ended or paused on purpose, or omp is closing.
+	 * Always asks the server (a missing message is fine): an earlier push may have landed even
+	 * when a later one failed.
+	 */
+	const cancelOfflineAlert = (loop: LoopState): Promise<void> => {
+		const config = loadNtfyConfig();
+		if (!config || config.offlineMinutes === 0) return Promise.resolve();
+		const pushedAt = loop.offlinePushedAt;
+		loop.offlinePushedAt = undefined;
+		return offlineOp(loop, async () => {
+			// A push from the last few seconds may not be stored yet (see cancelNtfy).
+			const settleMs = pushedAt === undefined ? 0 : Math.max(0, 2500 - (Date.now() - pushedAt));
+			const failure = await cancelNtfy(config, loopTopic(config, loop), OFFLINE_SEQUENCE, { settleMs });
+			if (failure) log(loop, `ntfy: could not cancel the offline alert (${failure}); it may still arrive.`);
+		});
+	};
+
+	/** Mark work as happening; reports the end of any stall that was reported. */
+	const noteActivity = (loop: LoopState): void => {
+		loop.lastActivity = Date.now();
+		for (const kind of ["worker", "idle"] as const) {
+			if (!loop.stalls.delete(kind)) continue;
+			log(loop, `Stall over (${kind}).`);
+			phone(loop, 2, ["arrow_forward"], kind === "worker" ? "Worker is active again." : "The loop is moving again.");
+		}
+	};
+
+	/** Run one manager call, marked busy so the watchdog can tell a hanging one. */
+	const asManager = async <T>(loop: LoopState, kind: "review" | "ask" | "audit", call: () => Promise<T>): Promise<T> => {
+		loop.managerBusy = { kind, since: Date.now() };
+		try {
+			return await call();
+		} finally {
+			loop.managerBusy = undefined;
+			noteActivity(loop);
+			if (loop.stalls.delete("manager")) phone(loop, 2, ["arrow_forward"], `The manager's ${kind} finished.`);
+		}
+	};
+
+	/**
+	 * Once a minute while a loop exists: push the offline alert back, and report stalls once each.
+	 * worker: a turn runs but nothing (tokens, tool output, turn boundaries) came for `stallMinutes`;
+	 * manager: a manager call runs longer than that (audit: plus its 30-minute budget);
+	 * idle: the loop should be working but nothing runs.
+	 */
+	const watchdogTick = (ctx: ExtensionContext, loop: LoopState): void => {
+		if (state !== loop) return;
+		const config = loadNtfyConfig();
+		// omp is alive through usage-limit waits too, so the offline alert keeps being pushed back.
+		if (!loop.paused) pushOfflineAlert(loop);
+		if (!config || loop.paused || loop.quotaWait !== undefined) return;
+		const now = Date.now();
+		const limit = config.stallMinutes * 60_000;
+		const quietFor = Math.round((now - loop.lastActivity) / 60_000);
+		const busy = loop.managerBusy;
+		if (busy) {
+			const budget = busy.kind === "audit" ? limit + AUDIT_TIMEOUT_MS : limit;
+			if (now - busy.since > budget && !loop.stalls.has("manager")) {
+				loop.stalls.add("manager");
+				log(loop, `Manager stall: ${busy.kind} running for ${Math.round((now - busy.since) / 60_000)} min.`);
+				phone(loop, 4, ["snail"], `Manager stall: its ${busy.kind} has been running for ${Math.round((now - busy.since) / 60_000)} min (slow provider, or a hung request).`);
+			}
+			return;
+		}
+		if (now - loop.lastActivity < limit) return;
+		if (!ctx.isIdle()) {
+			if (loop.ompWaitUntil !== undefined && now < loop.ompWaitUntil) return;
+			if (loop.stalls.has("worker")) return;
+			loop.stalls.add("worker");
+			log(loop, `Worker stall: no output for ${quietFor} min.`);
+			phone(loop, 4, ["snail"], `Worker stall: no tokens or tool output for ${quietFor} min (a long silent command, or a hang).`);
+			return;
+		}
+		if (loop.busy || loop.stalls.has("idle")) return;
+		loop.stalls.add("idle");
+		log(loop, `Idle stall: nothing ran for ${quietFor} min; nudging the loop.`);
+		phone(loop, 4, ["snail"], `Loop stall: nothing has run for ${quietFor} min although the loop is on. Nudging it once.`);
+		void advance(ctx);
+	};
+
+	const startWatchdog = (ctx: ExtensionContext, loop: LoopState): void => {
+		if (loop.watchdog) ctx.clearTimer(loop.watchdog);
+		loop.watchdog = ctx.setInterval(() => watchdogTick(ctx, loop), 60_000);
+		watchdogTick(ctx, loop);
+	};
+
+	const stopWatchdog = (ctx: ExtensionContext, loop: LoopState): void => {
+		if (loop.watchdog) ctx.clearTimer(loop.watchdog);
+		loop.watchdog = undefined;
+		void cancelOfflineAlert(loop);
 	};
 
 	const FINISH_PHONE: Record<"info" | "warning" | "error", { priority: NtfyPriority; tag: string }> = {
@@ -499,6 +702,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		state = undefined;
 		loop.abort.abort();
 		clearQuotaTimer(ctx, loop);
+		stopWatchdog(ctx, loop);
 		releaseUsageWaits();
 		persist(undefined);
 		log(loop, `## Loop ended after iteration ${loop.iteration}\n\n${message}`);
@@ -515,6 +719,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		loop.abort.abort();
 		loop.abort = new AbortController();
 		clearQuotaTimer(ctx, loop);
+		void cancelOfflineAlert(loop);
 		persist(loop);
 		updateStatus(ctx);
 		ctx.ui.notify(`seref_manager: ${message}`, "warning");
@@ -541,6 +746,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			prompt += `\n\nManager notes from ${source}:\n${notes.join("\n")}`;
 		}
 		updateStatus(ctx);
+		noteActivity(loop);
 		lastSentPrompt = prompt.trim();
 		pi.sendUserMessage(prompt, { attribution: "agent" });
 	};
@@ -575,7 +781,9 @@ export default function serefManager(pi: ExtensionAPI): void {
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
-				const verdict = parseIterationVerdict(await callManager(ctx, target, PROMPT_ITERATION, input, loop.abort.signal));
+				const verdict = parseIterationVerdict(
+					await asManager(loop, "review", () => callManager(ctx, target, PROMPT_ITERATION, input, loop.abort.signal)),
+				);
 				loop.managerFailures = 0;
 				return verdict;
 			} catch (error) {
@@ -667,6 +875,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (state !== loop || loop.paused) return;
 			if (gatePassed && !verdict) return finish(ctx, done, "info");
 			const notes: string[] = [];
+			let reviewNote = "";
 			let snapshot = after;
 			if (verdict) {
 				const edited = applyEdits(ledgerText, verdict.edits, `it${loop.iteration}`);
@@ -703,6 +912,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 						.filter(Boolean)
 						.join("\n"),
 				);
+				reviewNote = edited.applied.map(edit => `${edit.id} ${edit.kind === "reopen" ? "reopened" : "unblocked"}`).join(", ");
 				if (gatePassed && edited.applied.length === 0) return finish(ctx, `${done} The manager accepted the final iteration.`, "info");
 				if (loop.iteration >= loop.max) {
 					return finish(ctx, `iteration limit ${loop.max} reached after the manager reopened items.`, "warning");
@@ -725,6 +935,17 @@ export default function serefManager(pi: ExtensionAPI): void {
 			} else if (contextAction === "reset" && !(await resetSession(ctx, loop))) {
 				return;
 			}
+			const counts = countItems(snapshot);
+			const ticked = changes.filter(change => change.item.state === "done").map(change => change.item.id);
+			phone(
+				loop,
+				2,
+				["bar_chart"],
+				[
+					`Iteration ${loop.iteration}: ${ticked.length > 0 ? `ticked ${ticked.join(", ")}` : "no item ticked"}${reviewNote ? `; manager: ${reviewNote}` : ""}.`,
+					`${counts.done} done, ${counts.blocked} blocked, ${counts.open} open of ${counts.total}.`,
+				].join(" "),
+			);
 			startIteration(ctx, loop, snapshot, notes);
 		} catch (error) {
 			const quota = error instanceof UsageDepletedError ? error : usageLimitError(error);
@@ -756,7 +977,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			].join("\n\n");
 			for (let attempt = 0; attempt < 2 && !answers; attempt++) {
 				try {
-					answers = parseAskAnswers(await callManager(ctx, target, PROMPT_ASK, input, combined), questions);
+					answers = parseAskAnswers(await asManager(loop, "ask", () => callManager(ctx, target, PROMPT_ASK, input, combined)), questions);
 				} catch (error) {
 					if (combined.aborted) throw error;
 					failure = error;
@@ -898,7 +1119,9 @@ export default function serefManager(pi: ExtensionAPI): void {
 			askAvailable: shadowAsk(),
 			abort: new AbortController(),
 			quotaTimer: undefined,
+			...freshWatch(),
 		};
+		startWatchdog(ctx, state);
 		updateStatus(ctx);
 		if (waiting && saved.quotaWait) {
 			holdUsageWaits();
@@ -962,7 +1185,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			`## Ledger (${displayPath(root, loop.ledgerPath)})\n${ledgerText}`,
 		].join("\n\n");
 		let callCount = 0;
-		const { text, calls } = await callManagerWithTools(
+		const { text, calls } = await asManager(loop, "audit", () => callManagerWithTools(
 			ctx,
 			target,
 			PROMPT_AUDIT,
@@ -975,7 +1198,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 				maxCalls: AUDIT_TOOL_CALLS,
 				onCall: record => ctx.ui.setStatus("seref_manager", `seref audit · ${++callCount} tool calls · last: ${record.name}`),
 			},
-		);
+		));
 		const verdict = parseAuditVerdict(text);
 		const edited = applyEdits(await Bun.file(loop.ledgerPath).text(), verdict.edits, "audit");
 		if (edited.applied.length > 0) await Bun.write(loop.ledgerPath, edited.text);
@@ -1067,6 +1290,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 			askAvailable: false,
 			abort: new AbortController(),
 			quotaTimer: undefined,
+			ntfyTopic: loadNtfyConfig()?.perLoop ? perLoopTopic(path.basename(path.dirname(ledgerPath))) : undefined,
+			...freshWatch(),
 		};
 		const gate = await runGate(loop);
 		if (gate.code !== 0 && gate.code !== 1) throw new Error(`gate exit ${gate.code}: ${gate.summary}`);
@@ -1089,11 +1314,16 @@ export default function serefManager(pi: ExtensionAPI): void {
 		ctx.ui.notify(
 			[
 				`seref_manager: running ${displayPath(ctx.cwd, ledgerPath)}, max ${loop.max} iterations, manager ${modelName}, context ${loop.contextPolicy}, ${askNote}. ${gate.summary}`,
+				loop.ntfyTopic ? `phone: subscribe to ntfy topic ${loop.ntfyTopic} for this loop (announced on the general channel too)` : "",
 				...usageLines,
-			].join("\n"),
+			]
+				.filter(Boolean)
+				.join("\n"),
 			"info",
 		);
 		phone(loop, 2, ["arrow_forward"], `Started: ${gate.summary}. Manager ${modelName}.${audit ? ` Auditing ${unsupervised} earlier tick(s) first.` : ""}`);
+		announceLoop(loop, gate.summary);
+		startWatchdog(ctx, loop);
 		if (audit) {
 			persist(loop);
 			updateStatus(ctx);
@@ -1134,6 +1364,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 							void wakeFromQuota(ctx, loop, true);
 							return;
 						}
+						noteActivity(loop);
 						persist(loop);
 						updateStatus(ctx);
 						ctx.ui.notify("seref_manager: resumed", "info");
@@ -1164,20 +1395,32 @@ export default function serefManager(pi: ExtensionAPI): void {
 						if (!config) {
 							throw new Error(`no ntfy topic: set SEREF_NTFY_TOPIC or write {"topic": "…"} to ${NTFY_CONFIG_PATH}`);
 						}
-						const where = `${config.server}/${config.topic} (from ${config.origin}, min priority ${config.minPriority})`;
+						const loop = state;
+						const loopChannel = loop ? loopTopic(config, loop) : undefined;
+						const lines = [
+							`seref_manager phone notifications (${config.server}, config ${config.origin}):`,
+							`general channel ${config.topic}: ${config.perLoop ? "announces each new loop and its own topic" : "gets everything (perLoop is off)"}`,
+							loopChannel && loopChannel !== config.topic ? `this loop's channel: ${loopChannel}` : "",
+							`stall alerts after ${config.stallMinutes} min; offline alert ${config.offlineMinutes > 0 ? `after ${config.offlineMinutes} min without a sign of life` : "off"}; min priority ${config.minPriority}`,
+							outbox.pending > 0 ? `${outbox.pending} message(s) waiting for the network` : "",
+							await ntfyQuotaLine(config),
+						].filter(Boolean);
 						if (rest[0] !== "test") {
-							ctx.ui.notify(`seref_manager: phone notifications go to ${where}. /seref_manager notify test sends one.`, "info");
+							ctx.ui.notify(`${lines.join("\n")}\n/seref_manager notify test sends a test message.`, "info");
 							return;
 						}
 						// The test always goes out, whatever minPriority filters.
-						const failure = await sendNtfy({ ...config, minPriority: 1 }, {
-							title: `${path.basename(ctx.cwd)} · seref_manager`,
-							message: "Test notification: loop events from this machine arrive here.",
-							priority: 3,
-							tags: ["bell"],
-						});
-						if (failure) throw new Error(`test notification to ${where} failed: ${failure}`);
-						ctx.ui.notify(`seref_manager: test notification sent to ${where}`, "info");
+						const targets = [...new Set([config.topic, ...(loopChannel ? [loopChannel] : [])])];
+						for (const topic of targets) {
+							const failure = await publishNtfy(config, topic, {
+								title: `${path.basename(ctx.cwd)} · seref_manager`,
+								message: `Test notification for ${topic === config.topic ? "the general channel" : "this loop's channel"} from ${os.hostname()}.`,
+								priority: 3,
+								tags: ["bell"],
+							});
+							if (failure) throw new Error(`test notification to ${config.server}/${topic} failed: ${failure}`);
+						}
+						ctx.ui.notify(`seref_manager: test notification sent to ${targets.join(" and ")}`, "info");
 						return;
 					}
 					case "status": {
@@ -1288,6 +1531,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			// The loop stays saved in the session it ran in; resuming that session restores it.
 			loop.abort.abort();
 			clearQuotaTimer(ctx, loop);
+			stopWatchdog(ctx, loop);
 			releaseUsageWaits();
 			state = undefined;
 			updateStatus(ctx);
@@ -1296,24 +1540,51 @@ export default function serefManager(pi: ExtensionAPI): void {
 		restore(ctx);
 	});
 
-	// omp sleeping through a usage limit itself (retry.waitForUsageReset): show it on the status line.
+	// omp sleeping through a usage limit itself (retry.waitForUsageReset): show it, and do not call
+	// the silence a stall. Repeated other failures (network, overload) are reported once.
 	pi.on("auto_retry_start", (event, ctx) => {
 		const loop = state;
-		if (!loop || event.delayMs < 60_000 || !usageLimitError({ errorMessage: event.errorMessage, errorId: event.errorId })) return;
-		const until = formatClock(Date.now() + event.delayMs, Date.now());
-		ctx.ui.setStatus("seref_manager", `seref ${loop.iteration}/${loop.max} · usage limit, omp retries at ${until}`);
-		log(loop, `omp is waiting out a usage limit inside iteration ${loop.iteration}; it retries at ${new Date(Date.now() + event.delayMs).toISOString()}.`);
+		if (!loop) return;
+		if (event.delayMs >= 60_000 && usageLimitError({ errorMessage: event.errorMessage, errorId: event.errorId })) {
+			loop.ompWaitUntil = Date.now() + event.delayMs + 60_000;
+			const until = formatClock(Date.now() + event.delayMs, Date.now());
+			ctx.ui.setStatus("seref_manager", `seref ${loop.iteration}/${loop.max} · usage limit, omp retries at ${until}`);
+			log(loop, `omp is waiting out a usage limit inside iteration ${loop.iteration}; it retries at ${new Date(Date.now() + event.delayMs).toISOString()}.`);
+			phone(loop, 3, ["hourglass_flowing_sand"], `Usage limit hit inside iteration ${loop.iteration}; omp retries at ${until} by itself.`);
+			return;
+		}
+		if (event.attempt >= 3 && !loop.stalls.has("requests")) {
+			loop.stalls.add("requests");
+			log(loop, `Requests failing: attempt ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`);
+			phone(loop, 3, ["satellite"], `Model requests are failing (attempt ${event.attempt}/${event.maxAttempts}): ${event.errorMessage.slice(0, 300)}`);
+		}
 	});
 
 	// omp giving up on a usage limit: remember its estimate for the stop that follows.
 	pi.on("auto_retry_end", (event, ctx) => {
-		if (state) updateStatus(ctx);
+		const loop = state;
+		if (loop) {
+			updateStatus(ctx);
+			loop.ompWaitUntil = undefined;
+			if (event.success && loop.stalls.delete("requests")) phone(loop, 2, ["arrow_forward"], "Model requests work again.");
+		}
 		const waitMs = event.success ? undefined : ompWaitFromFinalError(event.finalError);
 		ompGiveUp = waitMs !== undefined ? { waitMs, at: Date.now() } : undefined;
 	});
 
-	pi.on("session_shutdown", () => {
-		state?.abort.abort();
+	// Anything the session streams counts as work for the stall watchdog.
+	for (const event of ["message_update", "tool_execution_start", "tool_execution_update", "tool_execution_end", "turn_start", "turn_end"] as const) {
+		pi.on(event, () => {
+			if (state) noteActivity(state);
+		});
+	}
+
+	pi.on("session_shutdown", async () => {
+		const loop = state;
 		state = undefined;
+		if (!loop) return;
+		loop.abort.abort();
+		// Closing omp is on purpose: the offline alert must not fire for it.
+		await cancelOfflineAlert(loop);
 	});
 }

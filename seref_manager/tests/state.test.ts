@@ -20,6 +20,7 @@ const loop: PersistedLoop = {
 	audited: true,
 	quotaWait: { until: 1_800_000_000_000, phase: "worker", provider: "anthropic", model: "claude-opus-5-5", source: "usage report" },
 	paused: false,
+	ntfyTopic: "horus-abcdefghjk",
 };
 
 const custom = (data: unknown) => ({ type: "custom", customType: STATE_ENTRY_TYPE, data });

@@ -76,7 +76,7 @@ Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
 | `/seref_manager stop` | end the loop |
 | `/seref_manager away [on\|off]` | toggle answering `ask` without the grace period |
 | `/seref_manager status` | iteration, item counts, manager model, usage per model, recent decisions, log path |
-| `/seref_manager notify [test]` | show where phone notifications go / send a test one |
+| `/seref_manager notify [test]` | show the phone channels, stall/offline settings and today's ntfy budget / send a test |
 
 Esc during a worker turn pauses the loop. `--context` defaults to `manager` (the manager picks
 per iteration); `reset` gives every iteration a fresh session, like `loop.mode: reset`.
@@ -180,30 +180,59 @@ manager role, e.g. `usage · manager openai-codex/gpt-6.1-sol: out of quota unti
 
 ### Phone notifications (ntfy)
 
-Loop events go to your phone through [ntfy](https://ntfy.sh): install the ntfy app and subscribe to
-the topic in `~/.config/seref_omp_tools/ntfy.json`:
+Loop events go to your phone through [ntfy](https://ntfy.sh), on two kinds of channel:
+
+- **The general channel** (`topic` in `~/.config/seref_omp_tools/ntfy.json`) only announces new
+  loops: `horus: new seref loop — horus · LOOP_X.md started on <host> (…). Subscribe to
+  horus-k3j8q2wmzv for its progress.` Tapping it opens that topic. Subscribe to this one once.
+- **One channel per loop** (`<project>-<10 random chars>`, made when the loop starts, kept across
+  restarts) gets everything about that loop. Subscribe when the announcement arrives; unsubscribe
+  when the loop is over.
 
 ```json
-{ "server": "https://ntfy.sh", "topic": "seref-…", "minPriority": 2 }
+{ "server": "https://ntfy.sh", "topic": "seref-…", "minPriority": 2, "stallMinutes": 20, "offlineMinutes": 60 }
 ```
 
-`SEREF_NTFY_TOPIC`, `SEREF_NTFY_SERVER` and `SEREF_NTFY_TOKEN` override the file. The file is read
-for every message, so edits apply at once; without a topic nothing is sent. Each message is titled
-`<project> · <ledger> · it N/M` (the project is the ledger's directory), so several loops on
-several projects stay apart.
+`SEREF_NTFY_TOPIC`, `SEREF_NTFY_SERVER` and `SEREF_NTFY_TOKEN` override the file, and
+`SEREF_NTFY_CONFIG` points at another file. The file is read for every message, so edits apply
+at once; without a topic nothing is sent. `"perLoop": false` sends everything to the general
+channel instead. Messages in a loop's channel are titled `<project> · <ledger> · it N/M`.
 
-| Event | Priority |
+| Event (loop channel) | Priority |
 |---|---|
-| Loop started; usage-limit wait over; `ask` answered for you; audit with nothing reopened | 2 (low) |
-| Loop done; waiting for a usage limit until HH:MM; audit reopened items | 3 (default) |
-| Stuck or iteration limit; loop paused by an error; an item became `[!]` blocked; an `ask` only you can decide | 4 (high) |
+| Started; progress after each iteration (items ticked, what the manager reopened, counts); a wait or stall over; `ask` answered for you; audit with nothing reopened | 2 (low) |
+| Done; waiting for a usage limit until HH:MM; model requests failing repeatedly (network, overload); audit reopened items; back online after ntfy was unreachable | 3 (default) |
+| Stuck or iteration limit; paused by an error; an item became `[!]` blocked; an `ask` only you can decide; a stall; no sign of life | 4 (high) |
 | Gate error (broken ledger) | 5 (urgent) |
 
-`minPriority` drops quieter events (`3` keeps only what changes the loop's course). Pauses and
-stops you caused yourself (`pause`, `stop`, Esc) are not sent. ntfy.sh is public: anyone who knows
-the topic can read it, and messages carry item text, so keep the topic unguessable or point
-`server` at a self-hosted ntfy with a `token`. A failed send is logged to `LOOP_X.manager.md` and
-never affects the loop.
+**Stalls**, each reported once, then once more when it ends (`stallMinutes`, default 20):
+
+- *worker*: a turn runs but no tokens, tool output or turn boundary came for that long (a long
+  silent command, or a hang). Not while omp itself sleeps through a usage limit.
+- *manager*: a review or `ask` answer runs longer than that (the audit: plus its 30 minutes).
+- *loop*: the loop is on but nothing runs; it is also nudged once.
+
+**No sign of life** is a dead man's switch kept on the ntfy server: while the loop is on (also
+during usage-limit waits), omp keeps pushing a scheduled message `offlineMinutes` into the future
+under one sequence id, at most every half of that. When omp crashes or is killed, the machine
+sleeps or goes off, or its network drops, the pushes stop and the server delivers the alert by
+itself. Pausing, stopping or closing omp cancels it. When ntfy was unreachable for a while and
+comes back, a "back online" message follows, and messages that could not be sent meanwhile are
+delivered, marked delayed.
+
+None of this is shown in omp's chat; the chat gets only the one line with the loop's topic at
+`run`. `/seref_manager notify` shows the channels, the stall and offline settings and how many of
+the day's messages are left; `/seref_manager notify test` sends a test to the general channel
+and the current loop's.
+
+Budget: ntfy.sh allows 250 messages a day per IP. A loop uses about 48 a day for the offline
+switch (one push per 30 minutes at the default 60) plus one per iteration and its events, so
+about four long loops at once fit; `"offlineMinutes": 0` turns the switch off, a higher value
+pushes less often. `minPriority: 3` drops the low-priority messages (progress included). Pauses
+and stops you caused yourself (`pause`, `stop`, Esc) are not sent. ntfy.sh is public: anyone who
+knows a topic can read it, and messages carry item text, so topics are random, and a self-hosted
+ntfy (`server` plus `token`) removes both the exposure and the limit. A failed send is logged to
+`LOOP_X.manager.md` and never affects the loop.
 
 ### Restarts and session switches
 
