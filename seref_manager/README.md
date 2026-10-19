@@ -97,6 +97,11 @@ Which model a review uses, first match wins:
 2. The Seref Manager role, with its thinking level.
 3. The session's model at `high`.
 
+Before each review, ask answer and audit, the manager checks the role model's quota in omp's usage
+reports (what `/usage` shows). When every account behind it is out, the review runs on the worker's
+model instead, announced once, until the role has quota again. Only when both are out does the
+loop wait, until whichever resets first.
+
 `auto`/`inherit` levels mean `high`; `off` disables reasoning. The role is read on every call, so
 changing it in `/models` mid-loop applies from the next review; `/seref_manager status` shows the
 model in use and where it came from. Cost: one manager call per iteration, plus one per `ask` it
@@ -151,12 +156,16 @@ usage limits; omp's own retry handles those inside the turn.
    then and the worker's turn just continues. The status line shows `usage limit, omp retries at
    HH:MM`; Esc cancels omp's wait.
 2. **Otherwise seref_manager waits.** When the worker's turn, the manager's review or the audit ends
-   on a usage limit, the loop does not pause or count a failure. It picks the next attempt from, in
-   order: the earliest account reset in omp's usage reports, the provider's "try again in"/
-   `retry-after` hint or omp's own estimate, else a probe 30 minutes out, plus one minute of margin.
-   The status line shows `usage limit, resumes HH:MM`. When the time comes it re-checks the usage
-   report (and waits longer if the account is still exhausted), then continues what stopped: the
-   worker gets a prompt to finish the interrupted iteration, or the review or audit runs again.
+   on a usage limit, the loop does not pause or count a failure. A manager or audit limit first
+   switches to the other manager model (role ↔ worker's model) if that one has quota, and continues
+   at once. Otherwise it picks the next attempt from, in order: the earliest account reset in omp's
+   usage reports for that model's provider (the same data as `/usage`: Claude's 5-hour and 7-day
+   windows per account, Codex's windows, …), the provider's "try again in"/`retry-after` hint or
+   omp's own estimate, else a probe 30 minutes out, plus one minute of margin. With several accounts
+   for one provider, the first account to reset counts, since omp rotates to it. The status line
+   shows `usage limit, resumes HH:MM`. When the time comes it re-checks the usage report (and waits
+   longer if the account is still out), then continues what stopped: the worker gets a prompt to
+   finish the interrupted iteration, or the review or audit runs again.
 3. **The wait survives a restart.** It is saved with the loop, so resuming the session (`omp -c`)
    re-arms it instead of restoring the loop paused.
 
@@ -164,6 +173,11 @@ usage limits; omp's own retry handles those inside the turn.
 `ask` that the manager cannot answer because of its own usage limit is deferred (the worker marks
 the item `BLOCKED: awaiting user:` and moves on). Every wait and its source go to
 `LOOP_X.manager.md`.
+
+`/seref_manager status` (and the `run` notice) lists the usage of every model the loop spends quota
+on: the worker (session model), its subagents (`task` role) when that is another model, and the
+manager role, e.g. `usage · manager google-antigravity/gemini-4-argon: out of quota until Sat Oct 24
+14:24; reviews use the worker's model meanwhile`.
 
 ### Restarts and session switches
 

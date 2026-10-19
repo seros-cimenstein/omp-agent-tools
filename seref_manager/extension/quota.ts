@@ -85,6 +85,44 @@ export function ompWaitFromFinalError(finalError: string | undefined): number | 
 	return match ? Number(match[1]) : undefined;
 }
 
+/** One model's account-pool usage, from omp's usage reports and credential blocks (`/usage`). */
+export interface RoleUsage {
+	/** omp's aggregate: `depleted` only when every account is out. */
+	state: "healthy" | "reserve" | "depleted" | "unknown";
+	/** Reset times (epoch ms) of the depleted accounts. */
+	resets: number[];
+	/** Largest remaining fraction (0–1) among accounts that report one. */
+	bestRemaining?: number;
+}
+
+export type ManagerChoice =
+	| { kind: "role" }
+	| { kind: "fallback" }
+	/** Neither model can run; `until` is the earliest known reset of either, if any. */
+	| { kind: "wait"; until: number | undefined };
+
+/**
+ * Which model reviews: the manager role while its quota lasts, else the worker's model (`fallback`,
+ * undefined when it is the same model) while that one lasts, else wait for whichever resets first.
+ */
+export function chooseManager(role: RoleUsage, fallback: RoleUsage | undefined, now: number): ManagerChoice {
+	if (role.state !== "depleted") return { kind: "role" };
+	if (fallback && fallback.state !== "depleted") return { kind: "fallback" };
+	const resets = [...role.resets, ...(fallback?.resets ?? [])].filter(reset => reset > now);
+	return { kind: "wait", until: resets.length > 0 ? Math.min(...resets) : undefined };
+}
+
+/** One line of usage for `/seref_manager status`. */
+export function describeUsage(usage: RoleUsage, now: number): string {
+	if (usage.state === "depleted") {
+		const resets = usage.resets.filter(reset => reset > now);
+		return resets.length > 0 ? `out of quota until ${formatClock(Math.min(...resets), now)}` : "out of quota, reset time unknown";
+	}
+	if (usage.state === "unknown") return "usage unknown (no usage report for this login)";
+	const left = usage.bestRemaining === undefined ? "" : `, best account ${Math.round(usage.bestRemaining * 100)}% left`;
+	return `${usage.state === "reserve" ? "running low" : "ok"}${left}`;
+}
+
 export function formatClock(at: number, now: number): string {
 	const date = new Date(at);
 	const time = date.toTimeString().slice(0, 5);

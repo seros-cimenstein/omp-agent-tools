@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { chooseResumeAt, findUsageLimit, ompWaitFromFinalError, PROBE_INTERVAL_MS, type QuotaError } from "../extension/quota";
+import {
+	chooseManager,
+	chooseResumeAt,
+	describeUsage,
+	findUsageLimit,
+	ompWaitFromFinalError,
+	PROBE_INTERVAL_MS,
+	type QuotaError,
+	type RoleUsage,
+} from "../extension/quota";
 
 /** Stand-in for omp's classifier (exercised against the real one in omp); annotates its argument like the real one. */
 const classifier = (fields: QuotaError): boolean => {
@@ -59,6 +68,36 @@ describe("chooseResumeAt", () => {
 		expect(chooseResumeAt({ now, accountResets: [now + 1_000] }).at).toBe(now + 61_000);
 		expect(chooseResumeAt({ now, accountResets: [], hintMs: 1 }).at).toBe(now + MINUTE + 1);
 	});
+});
+
+describe("chooseManager", () => {
+	const now = 1_000_000_000_000;
+	const ok: RoleUsage = { state: "healthy", resets: [], bestRemaining: 0.4 };
+	const out = (...resets: number[]): RoleUsage => ({ state: "depleted", resets });
+
+	test("the manager role reviews while it has quota, whatever the worker's model has", () => {
+		expect(chooseManager(ok, out(now + 1), now)).toEqual({ kind: "role" });
+		expect(chooseManager({ state: "unknown", resets: [] }, ok, now)).toEqual({ kind: "role" });
+	});
+
+	test("a role that is out (e.g. for days) hands reviews to the worker's model instead of stalling", () => {
+		expect(chooseManager(out(now + 5 * 86_400_000), ok, now)).toEqual({ kind: "fallback" });
+	});
+
+	test("with both out, or the role out and no separate worker model, wait for the first reset", () => {
+		expect(chooseManager(out(now + 7_200_000), out(now + 3_600_000, now - 1), now)).toEqual({ kind: "wait", until: now + 3_600_000 });
+		expect(chooseManager(out(now + 7_200_000), undefined, now)).toEqual({ kind: "wait", until: now + 7_200_000 });
+		expect(chooseManager(out(), out(), now)).toEqual({ kind: "wait", until: undefined });
+	});
+});
+
+test("usage lines read like /usage", () => {
+	const now = new Date("2026-10-19T10:00:00").getTime();
+	expect(describeUsage({ state: "healthy", resets: [], bestRemaining: 0.42 }, now)).toBe("ok, best account 42% left");
+	expect(describeUsage({ state: "reserve", resets: [] }, now)).toBe("running low");
+	expect(describeUsage({ state: "depleted", resets: [new Date("2026-10-19T14:30:00").getTime()] }, now)).toBe("out of quota until 14:30");
+	expect(describeUsage({ state: "depleted", resets: [new Date("2026-10-24T14:24:00").getTime()] }, now)).toBe("out of quota until Sat Oct 24 14:24");
+	expect(describeUsage({ state: "unknown", resets: [] }, now)).toMatch(/unknown/);
 });
 
 test("omp's give-up message carries the wait it computed", () => {

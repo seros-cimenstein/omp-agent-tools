@@ -34,6 +34,7 @@ import {
 	callManagerWithTools,
 	currentSettings,
 	describeTarget,
+	type ManagerTarget,
 	registerManagerRole,
 	resolveManagerModel,
 } from "./model";
@@ -45,7 +46,16 @@ import {
 	type PersistedLoop,
 	STATE_ENTRY_TYPE,
 } from "./state";
-import { chooseResumeAt, findUsageLimit, formatClock, ompWaitFromFinalError, type QuotaError } from "./quota";
+import {
+	chooseManager,
+	chooseResumeAt,
+	describeUsage,
+	findUsageLimit,
+	formatClock,
+	ompWaitFromFinalError,
+	type QuotaError,
+	type RoleUsage,
+} from "./quota";
 import { digestIteration, lastAssistant } from "./transcript";
 import { ledgerCommands, MANAGER_TOOLS, runManagerTool } from "./tools";
 import {
@@ -119,6 +129,8 @@ interface LoopState extends PersistedLoop {
 	abort: AbortController;
 	/** Wakes the loop when a usage-limit wait is due; not persisted (re-armed on restore). */
 	quotaTimer: Timer | undefined;
+	/** The manager-role→fallback switch last announced, so it is announced once. */
+	managerFallbackNotice?: string;
 }
 
 /** The usage-limit error in `value` (failed message or Error cause chain), by omp's own classifier. */
@@ -130,6 +142,18 @@ function usageLimitError(value: unknown): QuotaError | undefined {
 function providerHintMs(error: QuotaError): number | undefined {
 	const hint = extractProviderRetryHint(error.provider, error.errorMessage);
 	return hint !== undefined && hint > 0 ? hint : undefined;
+}
+
+/** No model can run the manager right now: the usage reports say both are out of quota. */
+class UsageDepletedError extends Error {
+	constructor(
+		readonly provider: string,
+		readonly model: string,
+		/** Earliest known reset of either model, if any. */
+		readonly until: number | undefined,
+	) {
+		super(`${provider}/${model} is out of quota`);
+	}
 }
 
 interface RunArgs {
@@ -290,12 +314,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 		);
 	};
 
-	/** Usage health of the account pool behind `provider`/`model`, from omp's usage reports and credential blocks. */
-	const usageHealth = async (
-		ctx: ExtensionContext,
-		provider: string,
-		model: string,
-	): Promise<{ state: string; resets: number[] }> => {
+	/** Usage of the account pool behind `provider`/`model`, from omp's usage reports and credential blocks (what `/usage` shows). */
+	const usageHealth = async (ctx: ExtensionContext, provider: string, model: string): Promise<RoleUsage> => {
 		try {
 			const health = await ctx.modelRegistry.authStorage.health.model(provider, {
 				modelId: model,
@@ -306,10 +326,85 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const resets = health.accounts.flatMap(account =>
 				account.state === "depleted" && account.resetsAt !== undefined ? [account.resetsAt] : [],
 			);
-			return { state: health.state, resets };
+			const remaining = health.accounts.flatMap(account =>
+				account.state !== "depleted" && account.remainingFraction !== undefined ? [account.remainingFraction] : [],
+			);
+			return {
+				state: health.state,
+				resets,
+				bestRemaining: remaining.length > 0 ? Math.max(...remaining) : undefined,
+			};
 		} catch {
 			return { state: "unknown", resets: [] };
 		}
+	};
+
+	/**
+	 * The manager model for the next call, by quota: the Seref Manager role while its accounts
+	 * have quota, else the worker's model, else `wait` until the first of them resets. Reads the
+	 * same usage data as `/usage`, so a role that is out for days does not stall the loop.
+	 */
+	const managerChoice = async (
+		ctx: ExtensionContext,
+		loop: LoopState,
+	): Promise<{ role: ManagerTarget; roleUsage: RoleUsage; target?: ManagerTarget; until?: number }> => {
+		const role = resolveManagerModel(ctx, settings, loop.modelSpec);
+		const roleUsage = await usageHealth(ctx, role.model.provider, role.model.id);
+		const worker = ctx.models.current();
+		const separate = worker !== undefined && (worker.provider !== role.model.provider || worker.id !== role.model.id);
+		const fallbackUsage =
+			roleUsage.state === "depleted" && worker && separate ? await usageHealth(ctx, worker.provider, worker.id) : undefined;
+		const choice = chooseManager(roleUsage, fallbackUsage, Date.now());
+		if (choice.kind === "role") return { role, roleUsage, target: role };
+		if (choice.kind === "fallback" && worker) {
+			return { role, roleUsage, target: { model: worker, effort: role.effort, source: "worker model (manager role out of quota)" } };
+		}
+		return { role, roleUsage, until: choice.kind === "wait" ? choice.until : undefined };
+	};
+
+	/** `managerChoice`, announcing a switch to the fallback once, and throwing when nothing can run. */
+	const pickManager = async (ctx: ExtensionContext, loop: LoopState): Promise<ManagerTarget> => {
+		const { role, roleUsage, target, until } = await managerChoice(ctx, loop);
+		if (!target) throw new UsageDepletedError(role.model.provider, role.model.id, until);
+		const notice = target === role ? undefined : `${role.model.provider}/${role.model.id}→${target.model.provider}/${target.model.id}`;
+		if (notice && loop.managerFallbackNotice !== notice) {
+			const message = `the manager model ${role.model.provider}/${role.model.id} (${role.source}) is ${describeUsage(roleUsage, Date.now())}; reviews use the worker's model ${target.model.provider}/${target.model.id} meanwhile.`;
+			log(loop, `Manager fallback: ${message}`);
+			ctx.ui.notify(`seref_manager: ${message}`, "warning");
+		}
+		loop.managerFallbackNotice = notice;
+		return target;
+	};
+
+	/**
+	 * One `/usage`-style line per model the loop spends quota on: the worker (session model), its
+	 * subagents (`task` role) when that is another model, and the manager role.
+	 */
+	const roleUsageLines = async (ctx: ExtensionContext, loop: LoopState): Promise<string[]> => {
+		const now = Date.now();
+		const worker = ctx.models.current();
+		const roles: { label: string; provider: string; id: string }[] = [];
+		if (worker) roles.push({ label: "worker", provider: worker.provider, id: worker.id });
+		try {
+			const task = resolveManagerModel(ctx, settings, "@task").model;
+			if (!worker || task.provider !== worker.provider || task.id !== worker.id) {
+				roles.push({ label: "subagents (task role)", provider: task.provider, id: task.id });
+			}
+		} catch {
+			// No task role configured; subagents use the worker's model.
+		}
+		const manager = resolveManagerModel(ctx, settings, loop.modelSpec).model;
+		roles.push({ label: "manager", provider: manager.provider, id: manager.id });
+		const usages = await Promise.all(roles.map(role => usageHealth(ctx, role.provider, role.id)));
+		const workerUsage = worker ? usages[0] : undefined;
+		return roles.map((role, index) => {
+			const usage = usages[index];
+			const fallback =
+				role.label === "manager" && usage.state === "depleted" && worker && workerUsage && workerUsage.state !== "depleted"
+					? `; reviews use the worker's model meanwhile`
+					: "";
+			return `usage · ${role.label} ${role.provider}/${role.id}: ${describeUsage(usage, now)}${fallback}`;
+		});
 	};
 
 	const armQuotaTimer = (ctx: ExtensionContext, loop: LoopState): void => {
@@ -328,32 +423,50 @@ export default function serefManager(pi: ExtensionAPI): void {
 	/**
 	 * Stop driving the loop until the usage limit that `phase` hit resets: compute when (usage
 	 * report, provider hint, omp's estimate, else a 30-minute probe), save it, and arm a timer.
-	 * Not a failure: no counter moves, and the iteration resumes where it stopped.
+	 * Not a failure: no counter moves, and the iteration resumes where it stopped. A manager or
+	 * audit limit first checks whether another model can take over (see `managerChoice`) and, if
+	 * so, continues right away instead of waiting.
 	 */
 	const enterQuotaWait = async (
 		ctx: ExtensionContext,
 		loop: LoopState,
 		phase: "worker" | "manager" | "audit",
-		error: QuotaError,
+		error: QuotaError | UsageDepletedError,
 	): Promise<void> => {
 		const current = ctx.models.current();
 		const provider = error.provider ?? current?.provider ?? "unknown";
 		const model = error.model ?? current?.id ?? "unknown";
+		if (phase !== "worker" && !(error instanceof UsageDepletedError)) {
+			const next = await managerChoice(ctx, loop).catch(() => undefined);
+			if (state !== loop || loop.paused) return;
+			if (next?.target && (next.target.model.provider !== provider || next.target.model.id !== model)) {
+				log(loop, `${provider}/${model} hit its usage limit during the ${phase}; ${next.target.model.provider}/${next.target.model.id} takes over.`);
+				if (phase === "manager") ctx.setTimeout(() => advance(ctx), 0);
+				else ctx.setTimeout(() => auditThenStart(ctx, loop), 0);
+				return;
+			}
+		}
 		const health = await usageHealth(ctx, provider, model);
 		if (state !== loop || loop.paused) return;
 		const now = Date.now();
 		const ompWaitMs = phase === "worker" && ompGiveUp && now - ompGiveUp.at < OMP_GIVE_UP_FRESH_MS ? ompGiveUp.waitMs : undefined;
-		const { at, source } = chooseResumeAt({ now, accountResets: health.resets, hintMs: providerHintMs(error), ompWaitMs });
+		const known = error instanceof UsageDepletedError && error.until !== undefined ? [error.until] : [];
+		const { at, source } = chooseResumeAt({
+			now,
+			accountResets: [...known, ...health.resets],
+			hintMs: error instanceof UsageDepletedError ? undefined : providerHintMs(error),
+			ompWaitMs,
+		});
 		loop.quotaWait = { until: at, phase, provider, model, source };
 		persist(loop);
 		updateStatus(ctx);
 		const who = phase === "worker" ? "the worker" : phase === "manager" ? "the manager's review" : "the audit";
 		log(
 			loop,
-			`## Usage limit (${who}, iteration ${loop.iteration})\n\n${provider}/${model}: ${error.errorMessage ?? "usage limit"}\nResumes ${new Date(at).toISOString()} (${source}).`,
+			`## Usage limit (${who}, iteration ${loop.iteration})\n\n${provider}/${model}: ${error instanceof UsageDepletedError ? "out of quota per the usage report" : (error.errorMessage ?? "usage limit")}\nResumes ${new Date(at).toISOString()} (${source}).`,
 		);
 		ctx.ui.notify(
-			`seref_manager: ${provider}/${model} hit its usage limit during ${who}. Waiting until ${formatClock(at, now)} (${source}), then the loop continues by itself. /seref_manager resume tries now, /seref_manager stop ends the loop.`,
+			`seref_manager: ${provider}/${model} ${error instanceof UsageDepletedError ? "is out of quota (and so is the fallback)" : "hit its usage limit"} during ${who}. Waiting until ${formatClock(at, now)} (${source}), then the loop continues by itself. /seref_manager resume tries now, /seref_manager stop ends the loop.`,
 			"warning",
 		);
 		armQuotaTimer(ctx, loop);
@@ -364,9 +477,17 @@ export default function serefManager(pi: ExtensionAPI): void {
 		const wait = loop.quotaWait;
 		if (!wait || state !== loop) return;
 		if (!force) {
-			const health = await usageHealth(ctx, wait.provider, wait.model);
+			// A manager or audit wait ends as soon as either manager model has quota again.
+			const later =
+				wait.phase === "worker"
+					? await usageHealth(ctx, wait.provider, wait.model).then(health =>
+							health.state === "depleted" ? health.resets.filter(reset => reset > Date.now() + 60_000) : [],
+						)
+					: await managerChoice(ctx, loop).then(
+							choice => (choice.target ? [] : choice.until !== undefined && choice.until > Date.now() + 60_000 ? [choice.until] : []),
+							() => [],
+						);
 			if (state !== loop || loop.paused || loop.quotaWait !== wait) return;
-			const later = health.state === "depleted" ? health.resets.filter(reset => reset > Date.now() + 60_000) : [];
 			if (later.length > 0) {
 				loop.quotaWait = { ...wait, until: Math.min(...later) + 60_000, source: "usage report" };
 				persist(loop);
@@ -457,7 +578,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		gateSummary: string,
 		gatePassed: boolean,
 	): Promise<IterationVerdict | undefined> => {
-		const target = resolveManagerModel(ctx, settings, loop.modelSpec);
+		const target = await pickManager(ctx, loop);
 		const usage = ctx.getContextUsage();
 		const input = [
 			`# Iteration ${loop.iteration} of ${loop.max}`,
@@ -627,7 +748,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			}
 			startIteration(ctx, loop, snapshot, notes);
 		} catch (error) {
-			const quota = usageLimitError(error);
+			const quota = error instanceof UsageDepletedError ? error : usageLimitError(error);
 			if (quota && state === loop && !loop.paused) void enterQuotaWait(ctx, loop, "manager", quota);
 			else if (state === loop && !loop.paused) pause(ctx, `${errorText(error)}. Loop paused; /seref_manager resume retries.`);
 		} finally {
@@ -645,7 +766,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		let answers: AskAnswer[] | undefined;
 		let failure: unknown;
 		try {
-			const target = resolveManagerModel(ctx, settings, loop.modelSpec);
+			const target = await pickManager(ctx, loop);
 			const ledgerText = await Bun.file(loop.ledgerPath)
 				.text()
 				.catch(() => "(ledger unreadable)");
@@ -668,7 +789,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		}
 
 		if (!answers) {
-			const quota = usageLimitError(failure);
+			const quota = failure instanceof UsageDepletedError || usageLimitError(failure) !== undefined;
 			log(loop, `## Iteration ${loop.iteration}: ask unanswered (manager failed: ${errorText(failure)})`);
 			ctx.ui.notify(`seref_manager: could not answer ask (${errorText(failure)})`, "warning");
 			const text = quota
@@ -842,7 +963,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		const ledgerText = await Bun.file(loop.ledgerPath).text();
 		const items = parseLedger(ledgerText).items.filter(item => item.state !== "open");
 		if (items.length === 0) return [];
-		const target = resolveManagerModel(ctx, settings, loop.modelSpec);
+		const target = await pickManager(ctx, loop);
 		const root = await repoRoot(loop.cwd);
 		ctx.ui.notify(
 			`seref_manager: auditing ${items.length} item(s) ticked or blocked before it took over, with ${describeTarget(target)}. /seref_manager pause stops it.`,
@@ -909,7 +1030,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (gate.code !== 1) return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error");
 			startIteration(ctx, loop, parseLedger(await Bun.file(loop.ledgerPath).text()), notes);
 		} catch (error) {
-			const quota = usageLimitError(error);
+			const quota = error instanceof UsageDepletedError ? error : usageLimitError(error);
 			if (quota && state === loop && !loop.paused) void enterQuotaWait(ctx, loop, "audit", quota);
 			else if (state === loop && !loop.paused) {
 				pause(ctx, `audit failed: ${errorText(error)}. /seref_manager resume retries it; run with --no-audit to skip it.`);
@@ -972,13 +1093,17 @@ export default function serefManager(pi: ExtensionAPI): void {
 			? `ask answered after ${loop.away ? 0 : loop.graceMs / 1000}s`
 			: "no ask tool in this session";
 		const modelName = describeTarget(target);
+		const usageLines = await roleUsageLines(ctx, loop);
 		state = loop;
 		log(
 			loop,
 			`# seref_manager run (${new Date().toISOString()})\n\nLedger: ${ledgerPath}\nMax iterations: ${loop.max}\nManager model: ${modelName}\nContext: ${loop.contextPolicy}\nStart: ${gate.summary}${audit ? `\nAudit: ${unsupervised} unsupervised item(s)` : ""}`,
 		);
 		ctx.ui.notify(
-			`seref_manager: running ${displayPath(ctx.cwd, ledgerPath)}, max ${loop.max} iterations, manager ${modelName}, context ${loop.contextPolicy}, ${askNote}. ${gate.summary}`,
+			[
+				`seref_manager: running ${displayPath(ctx.cwd, ledgerPath)}, max ${loop.max} iterations, manager ${modelName}, context ${loop.contextPolicy}, ${askNote}. ${gate.summary}`,
+				...usageLines,
+			].join("\n"),
 			"info",
 		);
 		if (audit) {
@@ -1054,11 +1179,13 @@ export default function serefManager(pi: ExtensionAPI): void {
 						}
 						const counts = countItems(loop.startSnapshot);
 						const target = resolveManagerModel(ctx, settings, loop.modelSpec);
+						const usageLines = await roleUsageLines(ctx, loop);
 						ctx.ui.notify(
 							[
 								`seref_manager: ${displayPath(ctx.cwd, loop.ledgerPath)}, iteration ${loop.iteration}/${loop.max}${loop.paused ? " (paused)" : ""}`,
 								`${counts.done} done, ${counts.blocked} blocked, ${counts.open} open of ${counts.total}`,
 								`manager: ${describeTarget(target)}; context: ${loop.contextPolicy}`,
+								...usageLines,
 								`ask: ${loop.away ? "manager answers at once" : `manager answers after ${loop.graceMs / 1000}s`}`,
 								loop.quotaWait
 									? `usage limit: ${loop.quotaWait.provider}/${loop.quotaWait.model} hit it during the ${loop.quotaWait.phase}; continues at ${formatClock(loop.quotaWait.until, Date.now())} (${loop.quotaWait.source})`
