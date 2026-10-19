@@ -23,7 +23,7 @@ export interface ManagerTarget {
 	model: Model;
 	effort: ManagerEffort;
 	/** Where the choice came from, for status lines. */
-	source: "--model" | "seref_manager role" | "session model" | "worker model (manager role out of quota)";
+	source: "--model" | "seref_manager role" | "session model";
 }
 
 /** The settings of the session whose handler is running (call inside a handler), else omp's global settings. */

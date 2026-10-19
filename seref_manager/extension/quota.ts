@@ -95,23 +95,6 @@ export interface RoleUsage {
 	bestRemaining?: number;
 }
 
-export type ManagerChoice =
-	| { kind: "role" }
-	| { kind: "fallback" }
-	/** Neither model can run; `until` is the earliest known reset of either, if any. */
-	| { kind: "wait"; until: number | undefined };
-
-/**
- * Which model reviews: the manager role while its quota lasts, else the worker's model (`fallback`,
- * undefined when it is the same model) while that one lasts, else wait for whichever resets first.
- */
-export function chooseManager(role: RoleUsage, fallback: RoleUsage | undefined, now: number): ManagerChoice {
-	if (role.state !== "depleted") return { kind: "role" };
-	if (fallback && fallback.state !== "depleted") return { kind: "fallback" };
-	const resets = [...role.resets, ...(fallback?.resets ?? [])].filter(reset => reset > now);
-	return { kind: "wait", until: resets.length > 0 ? Math.min(...resets) : undefined };
-}
-
 /** One line of usage for `/seref_manager status`. */
 export function describeUsage(usage: RoleUsage, now: number): string {
 	if (usage.state === "depleted") {

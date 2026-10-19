@@ -1,13 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
-	chooseManager,
 	chooseResumeAt,
 	describeUsage,
 	findUsageLimit,
 	ompWaitFromFinalError,
 	PROBE_INTERVAL_MS,
 	type QuotaError,
-	type RoleUsage,
 } from "../extension/quota";
 
 /** Stand-in for omp's classifier (exercised against the real one in omp); annotates its argument like the real one. */
@@ -67,27 +65,6 @@ describe("chooseResumeAt", () => {
 		expect(chooseResumeAt({ now, accountResets: [] })).toEqual({ at: now + PROBE_INTERVAL_MS, source: "probe" });
 		expect(chooseResumeAt({ now, accountResets: [now + 1_000] }).at).toBe(now + 61_000);
 		expect(chooseResumeAt({ now, accountResets: [], hintMs: 1 }).at).toBe(now + MINUTE + 1);
-	});
-});
-
-describe("chooseManager", () => {
-	const now = 1_000_000_000_000;
-	const ok: RoleUsage = { state: "healthy", resets: [], bestRemaining: 0.4 };
-	const out = (...resets: number[]): RoleUsage => ({ state: "depleted", resets });
-
-	test("the manager role reviews while it has quota, whatever the worker's model has", () => {
-		expect(chooseManager(ok, out(now + 1), now)).toEqual({ kind: "role" });
-		expect(chooseManager({ state: "unknown", resets: [] }, ok, now)).toEqual({ kind: "role" });
-	});
-
-	test("a role that is out (e.g. for days) hands reviews to the worker's model instead of stalling", () => {
-		expect(chooseManager(out(now + 5 * 86_400_000), ok, now)).toEqual({ kind: "fallback" });
-	});
-
-	test("with both out, or the role out and no separate worker model, wait for the first reset", () => {
-		expect(chooseManager(out(now + 7_200_000), out(now + 3_600_000, now - 1), now)).toEqual({ kind: "wait", until: now + 3_600_000 });
-		expect(chooseManager(out(now + 7_200_000), undefined, now)).toEqual({ kind: "wait", until: now + 7_200_000 });
-		expect(chooseManager(out(), out(), now)).toEqual({ kind: "wait", until: undefined });
 	});
 });
 

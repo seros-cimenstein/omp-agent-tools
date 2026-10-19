@@ -47,7 +47,6 @@ import {
 	STATE_ENTRY_TYPE,
 } from "./state";
 import {
-	chooseManager,
 	chooseResumeAt,
 	describeUsage,
 	findUsageLimit,
@@ -129,8 +128,6 @@ interface LoopState extends PersistedLoop {
 	abort: AbortController;
 	/** Wakes the loop when a usage-limit wait is due; not persisted (re-armed on restore). */
 	quotaTimer: Timer | undefined;
-	/** The manager-role→fallback switch last announced, so it is announced once. */
-	managerFallbackNotice?: string;
 }
 
 /** The usage-limit error in `value` (failed message or Error cause chain), by omp's own classifier. */
@@ -340,40 +337,16 @@ export default function serefManager(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * The manager model for the next call, by quota: the Seref Manager role while its accounts
-	 * have quota, else the worker's model, else `wait` until the first of them resets. Reads the
-	 * same usage data as `/usage`, so a role that is out for days does not stall the loop.
+	 * The manager model for the next call. Only ever the manager's own model: when the usage
+	 * reports (what `/usage` shows) say every account behind it is out, it throws with the earliest
+	 * account reset, and the loop waits for that instead of making a call that would fail.
 	 */
-	const managerChoice = async (
-		ctx: ExtensionContext,
-		loop: LoopState,
-	): Promise<{ role: ManagerTarget; roleUsage: RoleUsage; target?: ManagerTarget; until?: number }> => {
-		const role = resolveManagerModel(ctx, settings, loop.modelSpec);
-		const roleUsage = await usageHealth(ctx, role.model.provider, role.model.id);
-		const worker = ctx.models.current();
-		const separate = worker !== undefined && (worker.provider !== role.model.provider || worker.id !== role.model.id);
-		const fallbackUsage =
-			roleUsage.state === "depleted" && worker && separate ? await usageHealth(ctx, worker.provider, worker.id) : undefined;
-		const choice = chooseManager(roleUsage, fallbackUsage, Date.now());
-		if (choice.kind === "role") return { role, roleUsage, target: role };
-		if (choice.kind === "fallback" && worker) {
-			return { role, roleUsage, target: { model: worker, effort: role.effort, source: "worker model (manager role out of quota)" } };
-		}
-		return { role, roleUsage, until: choice.kind === "wait" ? choice.until : undefined };
-	};
-
-	/** `managerChoice`, announcing a switch to the fallback once, and throwing when nothing can run. */
 	const pickManager = async (ctx: ExtensionContext, loop: LoopState): Promise<ManagerTarget> => {
-		const { role, roleUsage, target, until } = await managerChoice(ctx, loop);
-		if (!target) throw new UsageDepletedError(role.model.provider, role.model.id, until);
-		const notice = target === role ? undefined : `${role.model.provider}/${role.model.id}→${target.model.provider}/${target.model.id}`;
-		if (notice && loop.managerFallbackNotice !== notice) {
-			const message = `the manager model ${role.model.provider}/${role.model.id} (${role.source}) is ${describeUsage(roleUsage, Date.now())}; reviews use the worker's model ${target.model.provider}/${target.model.id} meanwhile.`;
-			log(loop, `Manager fallback: ${message}`);
-			ctx.ui.notify(`seref_manager: ${message}`, "warning");
-		}
-		loop.managerFallbackNotice = notice;
-		return target;
+		const target = resolveManagerModel(ctx, settings, loop.modelSpec);
+		const usage = await usageHealth(ctx, target.model.provider, target.model.id);
+		if (usage.state !== "depleted") return target;
+		const resets = usage.resets.filter(reset => reset > Date.now());
+		throw new UsageDepletedError(target.model.provider, target.model.id, resets.length > 0 ? Math.min(...resets) : undefined);
 	};
 
 	/**
@@ -396,15 +369,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		const manager = resolveManagerModel(ctx, settings, loop.modelSpec).model;
 		roles.push({ label: "manager", provider: manager.provider, id: manager.id });
 		const usages = await Promise.all(roles.map(role => usageHealth(ctx, role.provider, role.id)));
-		const workerUsage = worker ? usages[0] : undefined;
-		return roles.map((role, index) => {
-			const usage = usages[index];
-			const fallback =
-				role.label === "manager" && usage.state === "depleted" && worker && workerUsage && workerUsage.state !== "depleted"
-					? `; reviews use the worker's model meanwhile`
-					: "";
-			return `usage · ${role.label} ${role.provider}/${role.id}: ${describeUsage(usage, now)}${fallback}`;
-		});
+		return roles.map((role, index) => `usage · ${role.label} ${role.provider}/${role.id}: ${describeUsage(usages[index], now)}`);
 	};
 
 	const armQuotaTimer = (ctx: ExtensionContext, loop: LoopState): void => {
@@ -423,9 +388,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 	/**
 	 * Stop driving the loop until the usage limit that `phase` hit resets: compute when (usage
 	 * report, provider hint, omp's estimate, else a 30-minute probe), save it, and arm a timer.
-	 * Not a failure: no counter moves, and the iteration resumes where it stopped. A manager or
-	 * audit limit first checks whether another model can take over (see `managerChoice`) and, if
-	 * so, continues right away instead of waiting.
+	 * Not a failure: no counter moves, and the iteration resumes where it stopped.
 	 */
 	const enterQuotaWait = async (
 		ctx: ExtensionContext,
@@ -436,16 +399,6 @@ export default function serefManager(pi: ExtensionAPI): void {
 		const current = ctx.models.current();
 		const provider = error.provider ?? current?.provider ?? "unknown";
 		const model = error.model ?? current?.id ?? "unknown";
-		if (phase !== "worker" && !(error instanceof UsageDepletedError)) {
-			const next = await managerChoice(ctx, loop).catch(() => undefined);
-			if (state !== loop || loop.paused) return;
-			if (next?.target && (next.target.model.provider !== provider || next.target.model.id !== model)) {
-				log(loop, `${provider}/${model} hit its usage limit during the ${phase}; ${next.target.model.provider}/${next.target.model.id} takes over.`);
-				if (phase === "manager") ctx.setTimeout(() => advance(ctx), 0);
-				else ctx.setTimeout(() => auditThenStart(ctx, loop), 0);
-				return;
-			}
-		}
 		const health = await usageHealth(ctx, provider, model);
 		if (state !== loop || loop.paused) return;
 		const now = Date.now();
@@ -466,7 +419,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			`## Usage limit (${who}, iteration ${loop.iteration})\n\n${provider}/${model}: ${error instanceof UsageDepletedError ? "out of quota per the usage report" : (error.errorMessage ?? "usage limit")}\nResumes ${new Date(at).toISOString()} (${source}).`,
 		);
 		ctx.ui.notify(
-			`seref_manager: ${provider}/${model} ${error instanceof UsageDepletedError ? "is out of quota (and so is the fallback)" : "hit its usage limit"} during ${who}. Waiting until ${formatClock(at, now)} (${source}), then the loop continues by itself. /seref_manager resume tries now, /seref_manager stop ends the loop.`,
+			`seref_manager: ${provider}/${model} ${error instanceof UsageDepletedError ? "is out of quota" : "hit its usage limit"} during ${who}. Waiting until ${formatClock(at, now)} (${source}), then the loop continues by itself. /seref_manager resume tries now, /seref_manager stop ends the loop.`,
 			"warning",
 		);
 		armQuotaTimer(ctx, loop);
@@ -477,16 +430,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 		const wait = loop.quotaWait;
 		if (!wait || state !== loop) return;
 		if (!force) {
-			// A manager or audit wait ends as soon as either manager model has quota again.
-			const later =
-				wait.phase === "worker"
-					? await usageHealth(ctx, wait.provider, wait.model).then(health =>
-							health.state === "depleted" ? health.resets.filter(reset => reset > Date.now() + 60_000) : [],
-						)
-					: await managerChoice(ctx, loop).then(
-							choice => (choice.target ? [] : choice.until !== undefined && choice.until > Date.now() + 60_000 ? [choice.until] : []),
-							() => [],
-						);
+			const health = await usageHealth(ctx, wait.provider, wait.model);
+			const later = health.state === "depleted" ? health.resets.filter(reset => reset > Date.now() + 60_000) : [];
 			if (state !== loop || loop.paused || loop.quotaWait !== wait) return;
 			if (later.length > 0) {
 				loop.quotaWait = { ...wait, until: Math.min(...later) + 60_000, source: "usage report" };
