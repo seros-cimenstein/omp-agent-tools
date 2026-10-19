@@ -75,7 +75,8 @@ Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
 | `/seref_manager pause` / `resume` | pause after the current turn / continue (re-reviews the last iteration) |
 | `/seref_manager stop` | end the loop |
 | `/seref_manager away [on\|off]` | toggle answering `ask` without the grace period |
-| `/seref_manager status` | iteration, item counts, manager model, recent decisions, log path |
+| `/seref_manager status` | iteration, item counts, manager model, usage per model, recent decisions, log path |
+| `/seref_manager notify [test]` | show where phone notifications go / send a test one |
 
 Esc during a worker turn pauses the loop. `--context` defaults to `manager` (the manager picks
 per iteration); `reset` gives every iteration a fresh session, like `loop.mode: reset`.
@@ -176,6 +177,33 @@ the item `BLOCKED: awaiting user:` and moves on). Every wait and its source go t
 `/seref_manager status` (and the `run` notice) lists the usage of every model the loop spends quota
 on: the worker (session model), its subagents (`task` role) when that is another model, and the
 manager role, e.g. `usage · manager openai-codex/gpt-6.1-sol: out of quota until Sat Oct 24 14:24`.
+
+### Phone notifications (ntfy)
+
+Loop events go to your phone through [ntfy](https://ntfy.sh): install the ntfy app and subscribe to
+the topic in `~/.config/seref_omp_tools/ntfy.json`:
+
+```json
+{ "server": "https://ntfy.sh", "topic": "seref-…", "minPriority": 2 }
+```
+
+`SEREF_NTFY_TOPIC`, `SEREF_NTFY_SERVER` and `SEREF_NTFY_TOKEN` override the file. The file is read
+for every message, so edits apply at once; without a topic nothing is sent. Each message is titled
+`<project> · <ledger> · it N/M` (the project is the ledger's directory), so several loops on
+several projects stay apart.
+
+| Event | Priority |
+|---|---|
+| Loop started; usage-limit wait over; `ask` answered for you; audit with nothing reopened | 2 (low) |
+| Loop done; waiting for a usage limit until HH:MM; audit reopened items | 3 (default) |
+| Stuck or iteration limit; loop paused by an error; an item became `[!]` blocked; an `ask` only you can decide | 4 (high) |
+| Gate error (broken ledger) | 5 (urgent) |
+
+`minPriority` drops quieter events (`3` keeps only what changes the loop's course). Pauses and
+stops you caused yourself (`pause`, `stop`, Esc) are not sent. ntfy.sh is public: anyone who knows
+the topic can read it, and messages carry item text, so keep the topic unguessable or point
+`server` at a self-hosted ntfy with a `token`. A failed send is logged to `LOOP_X.manager.md` and
+never affects the loop.
 
 ### Restarts and session switches
 
