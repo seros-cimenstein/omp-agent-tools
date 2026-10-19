@@ -28,7 +28,6 @@ export interface AskAnswer {
 	/** Option labels picked, exactly as offered. */
 	selected: string[];
 	custom?: string;
-	decided: boolean;
 	why: string;
 }
 
@@ -101,8 +100,8 @@ export function parseIterationVerdict(text: string): IterationVerdict {
 
 /**
  * Map the manager's ask reply onto the questions. Labels must match an offered option; a
- * single-select question takes only the first. A question the reply omits, or answers with
- * nothing usable, counts as deferred rather than guessed.
+ * single-select question takes only the first. The manager always decides: a reply that omits
+ * a question or answers it with nothing usable is an error, so the call is retried.
  */
 export function parseAskAnswers(text: string, questions: readonly AskQuestion[]): AskAnswer[] {
 	const raw = extractJsonObject(text);
@@ -110,23 +109,15 @@ export function parseAskAnswers(text: string, questions: readonly AskQuestion[])
 	const byId = new Map(arrayField(raw, "answers").map(entry => [entry.id, entry]));
 	return questions.map(question => {
 		const entry = byId.get(question.id);
-		if (!entry) return { id: question.id, question: question.question, selected: [], decided: false, why: "the manager gave no answer" };
+		if (!entry) throw new Error(`no answer for question "${question.id}"`);
 		const labels = new Set(question.options.map(option => option.label));
 		const picked = Array.isArray(entry.selected)
 			? entry.selected.filter((label): label is string => typeof label === "string" && labels.has(label))
 			: [];
 		const selected = question.multi === true ? picked : picked.slice(0, 1);
 		const custom = typeof entry.custom === "string" && entry.custom.trim() ? entry.custom.trim() : undefined;
-		const why = typeof entry.why === "string" ? entry.why.trim() : "";
-		const decided = entry.decided !== false && (selected.length > 0 || custom !== undefined);
-		return {
-			id: question.id,
-			question: question.question,
-			selected: decided ? selected : [],
-			custom: decided ? custom : undefined,
-			decided,
-			why: why || (decided ? "" : "the manager would not decide this for the user"),
-		};
+		if (selected.length === 0 && custom === undefined) throw new Error(`answer for "${question.id}" has no offered option and no custom text`);
+		return { id: question.id, question: question.question, selected, custom, why: typeof entry.why === "string" ? entry.why.trim() : "" };
 	});
 }
 

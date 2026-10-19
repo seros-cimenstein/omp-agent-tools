@@ -85,9 +85,9 @@ const PROMPT_ASK = fs.readFileSync(path.join(HERE, "prompts/ask.md"), "utf8");
 const PROMPT_AUDIT = fs.readFileSync(path.join(HERE, "prompts/audit.md"), "utf8");
 const PROMPT_WORKER = fs.readFileSync(path.join(HERE, "prompts/worker.md"), "utf8").trim();
 const DECISIONS_WITH_ASK =
-	"For a decision only the user can make, call `ask`: the loop manager answers it or tells you to mark the item blocked.";
+	"For a decision the user would make, call `ask`: the loop manager decides it for the user. Its answer, like a decision in a `MANAGER(…)` note, is the user's decision, also where the ledger reserves a choice for the user or operator. Never mark an item blocked to wait for a decision.";
 const DECISIONS_WITHOUT_ASK =
-	"There is no `ask` tool in this session: for a decision only the user can make, write the question in your final message; the loop manager answers it or tells you to mark the item blocked.";
+	"There is no `ask` tool in this session: for a decision the user would make, leave the item `- [ ]`, write the question in your final message and end the turn; the loop manager decides it for the user. Its answer, like a decision in a `MANAGER(…)` note, is the user's decision, also where the ledger reserves a choice for the user or operator. Never mark an item blocked to wait for a decision.";
 
 const DEFAULT_GRACE_SECONDS = 120;
 const MIN_DEFAULT_MAX = 5;
@@ -857,9 +857,13 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const ledgerText = await Bun.file(loop.ledgerPath).text();
 			const after = parseLedger(ledgerText);
 			const changes = changedItems(loop.startSnapshot, after);
-			for (const change of changes) {
-				if (change.item.state === "blocked") phone(loop, 4, ["raised_hand"], `Blocked, needs you: ${change.item.line.replace(/^- \[!\] /, "")}`);
-			}
+			const blockedNow = changes.filter(change => change.item.state === "blocked").map(change => change.item);
+			// Sent after the review: the manager decides blockers that only wait for a decision.
+			const phoneBlocked = (unblocked: readonly string[]): void => {
+				for (const item of blockedNow) {
+					if (!unblocked.includes(item.id)) phone(loop, 4, ["raised_hand"], `Blocked, needs you: ${item.line.replace(/^- \[!\] /, "")}`);
+				}
+			};
 			if (gatePassed && changes.length === 0) return finish(ctx, done, "info");
 			// Counted only once the review is through: a review retried after a usage limit is the same iteration.
 			const noProgress = progressKey(after) === progressKey(loop.startSnapshot) ? loop.noProgress + 1 : 0;
@@ -873,6 +877,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const verdict = await reviewIteration(ctx, loop, ledgerText, changes, gate.summary, gatePassed);
 			loop.noProgress = noProgress;
 			if (state !== loop || loop.paused) return;
+			if (!verdict) phoneBlocked([]);
 			if (gatePassed && !verdict) return finish(ctx, done, "info");
 			const notes: string[] = [];
 			let reviewNote = "";
@@ -883,6 +888,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 					await Bun.write(loop.ledgerPath, edited.text);
 					snapshot = parseLedger(edited.text);
 				}
+				phoneBlocked(edited.applied.filter(edit => edit.kind === "unblock").map(edit => edit.id));
 				for (const edit of edited.applied) {
 					if (edit.kind === "reopen") loop.reopenCounts[edit.id] = (loop.reopenCounts[edit.id] ?? 0) + 1;
 					notes.push(`- ${edit.id} ${edit.kind === "reopen" ? "was reopened" : "blocker was rejected"}: ${edit.reason}`);
@@ -992,36 +998,22 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const quota = failure instanceof UsageDepletedError || usageLimitError(failure) !== undefined;
 			log(loop, `## Iteration ${loop.iteration}: ask unanswered (manager failed: ${errorText(failure)})`);
 			ctx.ui.notify(`seref_manager: could not answer ask (${errorText(failure)})`, "warning");
+			// Out of quota, the manager waits for its reset; its review then decides the question.
 			const text = quota
-				? `Nobody is at the keyboard and the loop manager is out of its usage limit, so this is not decided. Mark the current item "- [!] … — BLOCKED: awaiting user: <your question>" and continue with the next open item.`
-				: `Nobody is at the keyboard and the loop manager could not answer (${errorText(failure)}). Take the conservative default, record the choice in the item's evidence, and continue.`;
+				? "Nobody is at the keyboard and the loop manager is out of its usage limit, so it decides this after its reset. Do not mark anything blocked: leave the current item `- [ ]`, write the question with its options and your recommendation as your final message, and end your turn now. The manager's decision arrives with the next iteration."
+				: `Nobody is at the keyboard and the loop manager could not answer (${errorText(failure)}). Take the default the ledger names, else the conservative option, record the choice in the item's evidence, and continue.`;
 			return { content: [{ type: "text", text }], details: {} };
 		}
 
-		const lines = answers.map(answer => {
-			if (!answer.decided) {
-				return `${answer.id}: NOT DECIDED (${answer.why}). Mark the current item "- [!] … — BLOCKED: awaiting user: ${answer.question}" and continue with the next open item.`;
-			}
-			const choice = [...answer.selected, ...(answer.custom ? [answer.custom] : [])].join(", ");
-			return `${answer.id}: ${choice}${answer.why ? ` (manager: ${answer.why})` : ""}`;
-		});
+		const choiceOf = (answer: AskAnswer): string => [...answer.selected, ...(answer.custom ? [answer.custom] : [])].join(", ");
+		const lines = answers.map(answer => `${answer.id}: ${choiceOf(answer)}${answer.why ? ` (manager: ${answer.why})` : ""}`);
 		log(
 			loop,
-			[
-				`## Iteration ${loop.iteration}: answered ask`,
-				...answers.map(
-					answer =>
-						`- Q (${answer.id}): ${answer.question}\n  A: ${answer.decided ? [...answer.selected, answer.custom ?? ""].filter(Boolean).join(", ") : "NOT DECIDED"} — ${answer.why}`,
-				),
-			].join("\n"),
+			[`## Iteration ${loop.iteration}: answered ask`, ...answers.map(answer => `- Q (${answer.id}): ${answer.question}\n  A: ${choiceOf(answer)} — ${answer.why}`)].join("\n"),
 		);
 		ctx.ui.notify(`seref_manager answered ask: ${lines.join(" | ")}`, "info");
 		for (const answer of answers) {
-			if (answer.decided) {
-				phone(loop, 2, ["speech_balloon"], `Answered for you: ${answer.question} → ${[...answer.selected, answer.custom ?? ""].filter(Boolean).join(", ")} (${answer.why})`);
-			} else {
-				phone(loop, 4, ["raised_hand"], `Needs your decision: ${answer.question} (${answer.why}). The worker marks the item blocked and moves on.`);
-			}
+			phone(loop, 2, ["speech_balloon"], `Decided for you: ${answer.question} → ${choiceOf(answer)}${answer.why ? ` (${answer.why})` : ""}`);
 		}
 		const results = answers.map((answer, index) => ({
 			id: answer.id,
@@ -1030,10 +1022,12 @@ export default function serefManager(pi: ExtensionAPI): void {
 			multi: questions[index].multi === true,
 			selectedOptions: answer.selected,
 			customInput: answer.custom,
-			note: `seref_manager${answer.decided ? "" : " (not decided)"}: ${answer.why}`,
+			note: `seref_manager: ${answer.why}`,
 		}));
 		return {
-			content: [{ type: "text", text: `Nobody is at the keyboard; seref_manager answered for the user.\n${lines.join("\n")}` }],
+			content: [
+				{ type: "text", text: `Nobody is at the keyboard; seref_manager decided for the user. This is the user's decision; act on it.\n${lines.join("\n")}` },
+			],
 			details: results.length === 1 ? results[0] : { results },
 		};
 	};

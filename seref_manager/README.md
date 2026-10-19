@@ -39,12 +39,16 @@ After each worker yield:
    result), and its own last 8 decisions. It replies with JSON:
    - `reopen`: `[x]` items ticked this iteration whose evidence the transcript doesn't back. The
      line goes back to `- [ ]`, losing its DONE evidence, with `— MANAGER(itN): reopened: <reason>`.
-   - `unblock`: `[!]` items whose reason is difficulty or size → `- [ ] … — MANAGER(itN): blocker rejected: …`.
-   - `answers`: questions the worker left in its final text, answered or explicitly deferred.
+   - `unblock`: `[!]` items whose reason is difficulty or size, or that only wait for a decision →
+     `- [ ] … — MANAGER(itN): blocker rejected: …`; for a decision, the reason is the manager's
+     choice. Kept: blockers that need a credential, an unreachable host or a manual step, or that
+     an explicit prohibition in the ledger or project (a path not to touch, a hold you placed) forces.
+   - `answers`: questions the worker left in its final text, always decided.
    - `guidance`: instructions for the next iteration.
    - `context`: `keep` the conversation, `compact` it, or `reset` to a fresh session (the worker
      then has only the ledger and the manager's notes). `--context` can fix this instead.
-   - `verdict`: `stuck` stops the loop. There is no `done`; the manager cannot finish the loop.
+   - `verdict`: `stuck` stops the loop, only when nothing can move without a credential, a host or
+     a manual step from you. There is no `done`; the manager cannot finish the loop.
 4. **Next iteration.** The worker prompt (`extension/prompts/worker.md`) plus the manager's notes.
 
 If one item is reopened 3 times, the loop stops so you can look at it. If the manager call fails
@@ -58,11 +62,13 @@ schema, description and TUI rendering:
 
 - No loop, or the loop is paused: it runs the native `ask` unchanged.
 - Loop running: the native dialog opens and you get `--grace` seconds (default 120) to answer.
-  After that the dialog closes and the manager answers from the ledger, the current iteration's
-  transcript, and the project's rules. It defers instead of guessing when the choice is
-  destructive, touches credentials, money or live data, breaks a ledger rule, or has no
-  conservative default. A deferred question tells the worker to mark the item
-  `BLOCKED: awaiting user: <question>` and move on.
+  After that the dialog closes and the manager decides for you, from the ledger, the current
+  iteration's transcript, and the project's rules. It never defers and never has the worker mark
+  the item blocked: its answer is your decision, also where the ledger reserves a choice for you
+  or "the operator". It takes the default the ledger names, else what its rules and the project's
+  conventions point to, else the most conservative option that still gets the item done. The
+  ledger's prohibitions (paths not to touch, forbidden windows, no destructive commands without a
+  backup) stay binding. Each decision is sent to your phone ("Decided for you: …").
 - `/seref_manager away` (or `--away`) skips the dialog: the manager answers at once.
 
 Every decision and answer is appended to `LOOP_X.manager.md` next to the ledger.
@@ -129,9 +135,11 @@ stay inside the repo:
   `curl -X POST`, …).
 
 Each `[x]` comes out `holds`, `reopen` (the line becomes `- [ ] … — MANAGER(audit): reopened: …`)
-or `unverifiable` (needs a live host or a deploy, so it stays ticked). Each `[!]` is kept or
-unblocked. The audit uses up to 60 tool calls and 30 minutes; its findings and every tool call go
-to `LOOP_X.manager.md`. When the gate still passes afterwards there is nothing left to run; otherwise
+or `unverifiable` (needs a live host or a deploy, so it stays ticked). Each `[!]` is kept (a
+credential, host or manual step, or an explicit prohibition) or unblocked, a blocker that only
+waits for a decision with the manager's choice. The audit uses up to 60 tool calls and 30
+minutes; its findings and every tool call go to `LOOP_X.manager.md`. When the gate still passes
+afterwards there is nothing left to run; otherwise
 iteration 1 starts with the audit's findings in its prompt. `--no-audit` skips it.
 
 ### omp's own `/loop`
@@ -170,9 +178,9 @@ usage limits; omp's own retry handles those inside the turn.
    re-arms it instead of restoring the loop paused.
 
 `/seref_manager resume` tries right away instead of waiting; `pause` and `stop` work as usual. An
-`ask` that the manager cannot answer because of its own usage limit is deferred (the worker marks
-the item `BLOCKED: awaiting user:` and moves on). Every wait and its source go to
-`LOOP_X.manager.md`.
+`ask` that the manager cannot answer because of its own usage limit is not deferred: the worker
+leaves the item open, ends its turn with the question, and the manager's review decides it once
+its limit resets. Every wait and its source go to `LOOP_X.manager.md`.
 
 `/seref_manager status` (and the `run` notice) lists the usage of every model the loop spends quota
 on: the worker (session model), its subagents (`task` role) when that is another model, and the
@@ -200,9 +208,9 @@ channel instead. Messages in a loop's channel are titled `<project> · <ledger> 
 
 | Event (loop channel) | Priority |
 |---|---|
-| Started; progress after each iteration (items ticked, what the manager reopened, counts); a wait or stall over; `ask` answered for you; audit with nothing reopened | 2 (low) |
+| Started; progress after each iteration (items ticked, what the manager reopened, counts); a wait or stall over; an `ask` the manager decided for you; audit with nothing reopened | 2 (low) |
 | Done; waiting for a usage limit until HH:MM; model requests failing repeatedly (network, overload); audit reopened items; back online after ntfy was unreachable | 3 (default) |
-| Stuck or iteration limit; paused by an error; an item became `[!]` blocked; an `ask` only you can decide; a stall; no sign of life | 4 (high) |
+| Stuck or iteration limit; paused by an error; an item stays `[!]` blocked after the review (credential, host, manual step); a stall; no sign of life | 4 (high) |
 | Gate error (broken ledger) | 5 (urgent) |
 
 **Stalls**, each reported once, then once more when it ends (`stallMinutes`, default 20):

@@ -11,10 +11,10 @@ For each `[x]` item, decide one of:
 
 An `INVALID:` tick claims the finding was wrong: check the reason it gives against the code.
 
-For each `[!]` item, decide `keep` (needs a user decision, a credential or an unreachable host) or `unblock` (the reason is difficulty, size, or something the worker can resolve with its tools).
+For each `[!]` item, decide `keep` or `unblock`. `keep` only when it truly needs something only the user has (a credential, an unreachable host, a manual step) or an explicit prohibition forbids the work (a path not to touch in the ledger, a hold the user placed in the project, a `BLOCKED: user veto` the user wrote). `unblock` everything else: difficulty, size, something the worker can resolve with its tools, and every blocker that only waits for a decision ("awaiting user", "needs the operator's choice"). You decide for the user: for a decision blocker, `how` is your decision ("decided: <choice>, because …"), taken from the default the ledger names, else its rules and the project's conventions, else the most conservative option that still gets the item done, within the ledger's prohibitions.
 
 Work efficiently: read the cited files and `git log`/`git diff` first; run the cheapest checks; one full test-suite run can cover many items. You have a limited number of tool calls; spend them on the items with the most risk. Never try to change anything.
 
 Reply with one JSON object and nothing else:
 
-{"checks": [{"id": "<item id>", "result": "holds" | "reopen" | "unverifiable" | "keep" | "unblock", "how": "<what you checked and saw, one or two sentences>"}], "summary": "<one sentence>"}
+{"checks": [{"id": "<item id>", "result": "holds" | "reopen" | "unverifiable" | "keep" | "unblock", "how": "<what you checked and saw, or your decision, one or two sentences>"}], "summary": "<one sentence>"}

@@ -42,34 +42,34 @@ describe("parseAskAnswers", () => {
 	const questions: AskQuestion[] = [
 		{ id: "db", question: "Database?", options: [{ label: "SQLite" }, { label: "Postgres" }] },
 		{ id: "fmt", question: "Formats?", options: [{ label: "json" }, { label: "csv" }], multi: true },
-		{ id: "drop", question: "Drop the prod table?", options: [{ label: "Yes" }, { label: "No" }] },
 	];
 
 	test("keeps offered labels only, one for single-select, several for multi", () => {
 		const answers = parseAskAnswers(
 			JSON.stringify({
 				answers: [
-					{ id: "db", selected: ["Postgres", "SQLite"], decided: true, why: "existing infra" },
-					{ id: "fmt", selected: ["json", "xml", "csv"], decided: true, why: "both used" },
-					{ id: "drop", selected: [], decided: false, why: "destructive on live data" },
+					{ id: "db", selected: ["Postgres", "SQLite"], why: "existing infra" },
+					{ id: "fmt", selected: ["json", "xml", "csv"], why: "both used" },
 				],
 			}),
 			questions,
 		);
-		expect(answers.map(answer => [answer.id, answer.decided, answer.selected])).toEqual([
-			["db", true, ["Postgres"]],
-			["fmt", true, ["json", "csv"]],
-			["drop", false, []],
+		expect(answers.map(answer => [answer.id, answer.selected])).toEqual([
+			["db", ["Postgres"]],
+			["fmt", ["json", "csv"]],
 		]);
 	});
 
-	test("an omitted question or an answer with no usable label is deferred, not guessed", () => {
-		const answers = parseAskAnswers(JSON.stringify({ answers: [{ id: "db", selected: ["MySQL"], decided: true }] }), questions);
-		expect(answers.every(answer => !answer.decided)).toBe(true);
+	test("a reply that leaves a question without a usable choice is rejected, so the manager is asked again", () => {
+		const fmt = { id: "fmt", selected: ["csv"] };
+		expect(() => parseAskAnswers(JSON.stringify({ answers: [fmt] }), questions)).toThrow(/no answer for question "db"/);
+		expect(() => parseAskAnswers(JSON.stringify({ answers: [{ id: "db", selected: ["MySQL"] }, fmt] }), questions)).toThrow(/"db" has no offered option/);
+		// An old-style refusal is no decision either.
+		expect(() => parseAskAnswers(JSON.stringify({ answers: [{ id: "db", selected: [], decided: false }, fmt] }), questions)).toThrow(/"db"/);
 	});
 
 	test("custom text counts as an answer when no option fits", () => {
-		const [db] = parseAskAnswers(JSON.stringify({ answers: [{ id: "db", selected: [], custom: "DuckDB", why: "analytics" }] }), questions);
-		expect(db).toMatchObject({ decided: true, custom: "DuckDB", selected: [] });
+		const [db] = parseAskAnswers(JSON.stringify({ answers: [{ id: "db", selected: [], custom: "DuckDB", why: "analytics" }, { id: "fmt", selected: ["csv"] }] }), questions);
+		expect(db).toMatchObject({ custom: "DuckDB", selected: [] });
 	});
 });
