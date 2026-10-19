@@ -191,8 +191,8 @@ manager role, e.g. `usage · manager openai-codex/gpt-6.1-sol: out of quota unti
 Loop events go to your phone through [ntfy](https://ntfy.sh), on two kinds of channel:
 
 - **The general channel** (`topic` in `~/.config/seref_omp_tools/ntfy.json`) only announces new
-  loops: `horus: new seref loop — horus · LOOP_X.md started on <host> (…). Subscribe to
-  horus-k3j8q2wmzv for its progress.` Tapping it opens that topic. Subscribe to this one once.
+  loops: `horus` / `New loop started. Tap to follow it (horus-k3j8q2wmzv).` Tapping it opens that
+  topic. Subscribe to this one once.
 - **One channel per loop** (`<project>-<10 random chars>`, made when the loop starts, kept across
   restarts) gets everything about that loop. Subscribe when the announcement arrives; unsubscribe
   when the loop is over.
@@ -204,7 +204,9 @@ Loop events go to your phone through [ntfy](https://ntfy.sh), on two kinds of ch
 `SEREF_NTFY_TOPIC`, `SEREF_NTFY_SERVER` and `SEREF_NTFY_TOKEN` override the file, and
 `SEREF_NTFY_CONFIG` points at another file. The file is read for every message, so edits apply
 at once; without a topic nothing is sent. `"perLoop": false` sends everything to the general
-channel instead. Messages in a loop's channel are titled `<project> · <ledger> · it N/M`.
+channel instead. Messages are short and in plain words, titled with the project, e.g.
+`Round 3: finished A2, A3. 5/26 done.`, `Picked "Drop the line" for: …`, `A7 needs you: no SSH
+access to the Pi`, `No activity for 20 min. Might be stuck.`, `All done!`
 
 | Event (loop channel) | Priority |
 |---|---|
@@ -226,7 +228,7 @@ under one sequence id, at most every half of that. When omp crashes or is killed
 sleeps or goes off, or its network drops, the pushes stop and the server delivers the alert by
 itself. Pausing, stopping or closing omp cancels it. When ntfy was unreachable for a while and
 comes back, a "back online" message follows, and messages that could not be sent meanwhile are
-delivered, marked delayed.
+delivered, starting with the time they were meant for (`From 14:05: …`).
 
 None of this is shown in omp's chat; the chat gets only the one line with the loop's topic at
 `run`. `/seref_manager notify` shows the channels, the stall and offline settings and how many of

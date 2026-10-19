@@ -470,12 +470,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			`seref_manager: ${provider}/${model} ${error instanceof UsageDepletedError ? "is out of quota" : "hit its usage limit"} during ${who}. Waiting until ${formatClock(at, now)} (${source}), then the loop continues by itself. /seref_manager resume tries now, /seref_manager stop ends the loop.`,
 			"warning",
 		);
-		phone(
-			loop,
-			3,
-			["hourglass_flowing_sand"],
-			`${provider}/${model} ${error instanceof UsageDepletedError ? "is out of quota" : "hit its usage limit"} during ${who}. The loop continues by itself at ${formatClock(at, now)} (${source}).`,
-		);
+		phone(loop, 3, ["hourglass_flowing_sand"], `Hit the ${phase === "worker" ? "AI" : "manager"} usage limit. Continues at ${formatClock(at, now)} by itself.`);
 		armQuotaTimer(ctx, loop);
 	};
 
@@ -508,7 +503,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 		log(loop, `Usage limit wait over; resuming ${wait.phase === "worker" ? `iteration ${loop.iteration}` : wait.phase}.`);
 		ctx.ui.notify(`seref_manager: usage limit wait over (${wait.provider}/${wait.model}); continuing.`, "info");
-		phone(loop, 2, ["arrow_forward"], `Usage limit over for ${wait.provider}/${wait.model}; the loop continues.`);
+		phone(loop, 2, ["arrow_forward"], "Usage limit over. Back to work.");
 		if (wait.phase === "worker") {
 			const prompt = `[seref_manager · iteration ${loop.iteration}/${loop.max}] ${QUOTA_RESUME_PROMPT}`;
 			lastSentPrompt = prompt;
@@ -523,28 +518,42 @@ export default function serefManager(pi: ExtensionAPI): void {
 	/** Where a loop's messages go: its own topic, or the general one when `perLoop` is off. */
 	const loopTopic = (config: NtfyConfig, loop: LoopState): string => (config.perLoop && loop.ntfyTopic) || config.topic;
 
+	/** Phone text stays short: cut at `max` characters. */
+	const short = (text: string, max: number): string => (text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`);
+
+	/** "5/26 done", plus how many items wait for the user. */
+	const tallyText = (snapshot: LedgerSnapshot): string => {
+		const counts = countItems(snapshot);
+		return `${counts.done}/${counts.total} done${counts.blocked > 0 ? `, ${counts.blocked} ${counts.blocked === 1 ? "needs" : "need"} you` : ""}`;
+	};
+
+	/** "All done!", plus how many items were left for the user. */
+	const doneText = (snapshot: LedgerSnapshot): string => {
+		const { blocked } = countItems(snapshot);
+		return blocked > 0 ? `All done! ${blocked} left for you.` : "All done!";
+	};
+
 	/**
 	 * Push one event to the phone through ntfy, into the loop's own topic, titled with the project
-	 * (the ledger's directory) and ledger. Config is re-read each time, so edits apply at once; no
-	 * config, no message. Never shown in omp's chat.
+	 * (the ledger's directory). Short, plain words: it is read on a lock screen. Config is re-read
+	 * each time, so edits apply at once; no config, no message. Never shown in omp's chat.
 	 */
 	const phone = (loop: LoopState, priority: NtfyPriority, tags: string[], message: string): void => {
 		const config = loadNtfyConfig();
 		if (!config) return;
-		const title = `${path.basename(path.dirname(loop.ledgerPath))} · ${path.basename(loop.ledgerPath)} · it ${loop.iteration}/${loop.max}`;
+		const title = path.basename(path.dirname(loop.ledgerPath));
 		void outbox.send(config, loopTopic(config, loop), { title, message, priority, tags }).then(failure => {
 			if (failure) log(loop, `ntfy notification failed (kept for later): ${failure}`);
 		});
 	};
 
 	/** Announce a new loop on the general channel with the topic to subscribe to for it. */
-	const announceLoop = (loop: LoopState, summary: string): void => {
+	const announceLoop = (loop: LoopState): void => {
 		const config = loadNtfyConfig();
 		if (!config?.perLoop || !loop.ntfyTopic) return;
-		const project = path.basename(path.dirname(loop.ledgerPath));
 		void outbox.send(config, config.topic, {
-			title: `${project}: new seref loop`,
-			message: `${project} · ${path.basename(loop.ledgerPath)} started on ${os.hostname()} (${summary}). Subscribe to ${loop.ntfyTopic} for its progress.`,
+			title: path.basename(path.dirname(loop.ledgerPath)),
+			message: `New loop started. Tap to follow it (${loop.ntfyTopic}).`,
 			priority: 3,
 			tags: ["new"],
 			click: `${config.server}/${loop.ntfyTopic}`,
@@ -576,8 +585,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 			// Queued behind a cancel for a loop that ended or paused meanwhile: nothing to push.
 			if (state !== loop || loop.paused) return;
 			const failure = await publishNtfy(config, loopTopic(config, loop), {
-				title: `${project} · ${path.basename(loop.ledgerPath)}: no sign of life`,
-				message: `No sign of life from omp on ${os.hostname()} for ${config.offlineMinutes} min, last at ${new Date(now).toTimeString().slice(0, 5)}: omp crashed or was closed without stopping the loop, the machine is asleep or off, or its network is down. Last known: iteration ${loop.iteration}/${loop.max}.`,
+				title: project,
+				message: `Lost contact for ${config.offlineMinutes} min. The computer may be off, asleep or offline, or omp crashed.`,
 				priority: 4,
 				tags: ["skull"],
 				sequenceId: OFFLINE_SEQUENCE,
@@ -591,7 +600,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const since = loop.offlineFailingSince;
 			loop.offlineFailingSince = undefined;
 			if (since !== undefined && now - since > 5 * 60_000) {
-				phone(loop, 3, ["signal_strength"], `Back online: ntfy was unreachable from ${new Date(since).toTimeString().slice(0, 5)} (the offline alert may have fired meanwhile).`);
+				phone(loop, 3, ["signal_strength"], "Back online.");
 			}
 		});
 	};
@@ -620,7 +629,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		for (const kind of ["worker", "idle"] as const) {
 			if (!loop.stalls.delete(kind)) continue;
 			log(loop, `Stall over (${kind}).`);
-			phone(loop, 2, ["arrow_forward"], kind === "worker" ? "Worker is active again." : "The loop is moving again.");
+			phone(loop, 2, ["arrow_forward"], "Working again.");
 		}
 	};
 
@@ -632,7 +641,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		} finally {
 			loop.managerBusy = undefined;
 			noteActivity(loop);
-			if (loop.stalls.delete("manager")) phone(loop, 2, ["arrow_forward"], `The manager's ${kind} finished.`);
+			if (loop.stalls.delete("manager")) phone(loop, 2, ["arrow_forward"], "Manager is done. Working again.");
 		}
 	};
 
@@ -657,7 +666,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (now - busy.since > budget && !loop.stalls.has("manager")) {
 				loop.stalls.add("manager");
 				log(loop, `Manager stall: ${busy.kind} running for ${Math.round((now - busy.since) / 60_000)} min.`);
-				phone(loop, 4, ["snail"], `Manager stall: its ${busy.kind} has been running for ${Math.round((now - busy.since) / 60_000)} min (slow provider, or a hung request).`);
+				phone(loop, 4, ["snail"], `Manager has been thinking for ${Math.round((now - busy.since) / 60_000)} min. Might be stuck.`);
 			}
 			return;
 		}
@@ -667,13 +676,13 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (loop.stalls.has("worker")) return;
 			loop.stalls.add("worker");
 			log(loop, `Worker stall: no output for ${quietFor} min.`);
-			phone(loop, 4, ["snail"], `Worker stall: no tokens or tool output for ${quietFor} min (a long silent command, or a hang).`);
+			phone(loop, 4, ["snail"], `No activity for ${quietFor} min. Might be stuck.`);
 			return;
 		}
 		if (loop.busy || loop.stalls.has("idle")) return;
 		loop.stalls.add("idle");
 		log(loop, `Idle stall: nothing ran for ${quietFor} min; nudging the loop.`);
-		phone(loop, 4, ["snail"], `Loop stall: nothing has run for ${quietFor} min although the loop is on. Nudging it once.`);
+		phone(loop, 4, ["snail"], `Idle for ${quietFor} min. Giving it a nudge.`);
 		void advance(ctx);
 	};
 
@@ -695,8 +704,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 		error: { priority: 5, tag: "rotating_light" },
 	};
 
-	/** End the loop. `alert: false` for endings the user caused, which need no phone message. */
-	const finish = (ctx: ExtensionContext, message: string, level: "info" | "warning" | "error", alert = true): void => {
+	/** End the loop. `phoneText` (short, plain words) goes to the phone; none for endings the user caused. */
+	const finish = (ctx: ExtensionContext, message: string, level: "info" | "warning" | "error", phoneText?: string): void => {
 		const loop = state;
 		if (!loop) return;
 		state = undefined;
@@ -708,11 +717,11 @@ export default function serefManager(pi: ExtensionAPI): void {
 		log(loop, `## Loop ended after iteration ${loop.iteration}\n\n${message}`);
 		updateStatus(ctx);
 		ctx.ui.notify(`seref_manager: ${message}`, level);
-		if (alert) phone(loop, FINISH_PHONE[level].priority, [FINISH_PHONE[level].tag], `Loop ended: ${message}`);
+		if (phoneText) phone(loop, FINISH_PHONE[level].priority, [FINISH_PHONE[level].tag], phoneText);
 	};
 
-	/** Pause the loop. `alert: false` for pauses the user caused (the pause command, Esc). */
-	const pause = (ctx: ExtensionContext, message: string, alert = true): void => {
+	/** Pause the loop. `phoneText` (short, plain words) goes to the phone; none for pauses the user caused. */
+	const pause = (ctx: ExtensionContext, message: string, phoneText?: string): void => {
 		const loop = state;
 		if (!loop) return;
 		loop.paused = true;
@@ -723,7 +732,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		persist(loop);
 		updateStatus(ctx);
 		ctx.ui.notify(`seref_manager: ${message}`, "warning");
-		if (alert) phone(loop, 4, ["pause_button"], `Loop paused: ${message}`);
+		if (phoneText) phone(loop, 4, ["pause_button"], phoneText);
 	};
 
 	const runGate = async (loop: LoopState): Promise<{ code: number; summary: string }> => {
@@ -824,7 +833,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		try {
 			const result = await command.newSession({ parentSession: ctx.sessionManager.getSessionFile() });
 			if (result.cancelled) {
-				pause(ctx, "starting a fresh session was cancelled; loop paused.");
+				pause(ctx, "starting a fresh session was cancelled; loop paused.", "Paused: couldn't start a fresh session. Open omp to resume.");
 				return false;
 			}
 		} finally {
@@ -849,7 +858,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (!(await waitForIdle(ctx)) || state !== loop || loop.paused) return;
 			const gate = await runGate(loop);
 			if (gate.code !== 0 && gate.code !== 1) {
-				return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error");
+				return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error", "Stopped: the task list file has a problem.");
 			}
 			const gatePassed = gate.code === 0;
 			const done = `gate passed (${gate.summary}). Done after ${loop.iteration} iterations.`;
@@ -861,24 +870,24 @@ export default function serefManager(pi: ExtensionAPI): void {
 			// Sent after the review: the manager decides blockers that only wait for a decision.
 			const phoneBlocked = (unblocked: readonly string[]): void => {
 				for (const item of blockedNow) {
-					if (!unblocked.includes(item.id)) phone(loop, 4, ["raised_hand"], `Blocked, needs you: ${item.line.replace(/^- \[!\] /, "")}`);
+					if (!unblocked.includes(item.id)) phone(loop, 4, ["raised_hand"], `${item.id} needs you: ${short(item.line.split(" — BLOCKED: ")[1] ?? "blocked", 100)}`);
 				}
 			};
-			if (gatePassed && changes.length === 0) return finish(ctx, done, "info");
+			if (gatePassed && changes.length === 0) return finish(ctx, done, "info", doneText(after));
 			// Counted only once the review is through: a review retried after a usage limit is the same iteration.
 			const noProgress = progressKey(after) === progressKey(loop.startSnapshot) ? loop.noProgress + 1 : 0;
 			if (!gatePassed && loop.iteration >= loop.max) {
-				return finish(ctx, `iteration limit ${loop.max} reached (${gate.summary}).`, "warning");
+				return finish(ctx, `iteration limit ${loop.max} reached (${gate.summary}).`, "warning", `Stopped: used all ${loop.max} rounds. ${tallyText(after)}.`);
 			}
 			if (!gatePassed && noProgress >= NO_PROGRESS_LIMIT) {
-				return finish(ctx, `stuck: ${noProgress} iterations without any ledger change (${gate.summary}).`, "warning");
+				return finish(ctx, `stuck: ${noProgress} iterations without any ledger change (${gate.summary}).`, "warning", `Stopped: no progress in ${noProgress} rounds. ${tallyText(after)}.`);
 			}
 
 			const verdict = await reviewIteration(ctx, loop, ledgerText, changes, gate.summary, gatePassed);
 			loop.noProgress = noProgress;
 			if (state !== loop || loop.paused) return;
 			if (!verdict) phoneBlocked([]);
-			if (gatePassed && !verdict) return finish(ctx, done, "info");
+			if (gatePassed && !verdict) return finish(ctx, done, "info", doneText(after));
 			const notes: string[] = [];
 			let reviewNote = "";
 			let snapshot = after;
@@ -918,16 +927,25 @@ export default function serefManager(pi: ExtensionAPI): void {
 						.filter(Boolean)
 						.join("\n"),
 				);
-				reviewNote = edited.applied.map(edit => `${edit.id} ${edit.kind === "reopen" ? "reopened" : "unblocked"}`).join(", ");
-				if (gatePassed && edited.applied.length === 0) return finish(ctx, `${done} The manager accepted the final iteration.`, "info");
+				const redo = edited.applied.filter(edit => edit.kind === "reopen").map(edit => edit.id);
+				const unstuck = edited.applied.filter(edit => edit.kind === "unblock").map(edit => edit.id);
+				reviewNote = `${redo.length > 0 ? ` Sent back to redo: ${redo.join(", ")}.` : ""}${unstuck.length > 0 ? ` Unstuck: ${unstuck.join(", ")}.` : ""}`;
+				if (gatePassed && edited.applied.length === 0) {
+					return finish(ctx, `${done} The manager accepted the final iteration.`, "info", doneText(snapshot));
+				}
 				if (loop.iteration >= loop.max) {
-					return finish(ctx, `iteration limit ${loop.max} reached after the manager reopened items.`, "warning");
+					return finish(ctx, `iteration limit ${loop.max} reached after the manager reopened items.`, "warning", `Stopped: used all ${loop.max} rounds. ${tallyText(snapshot)}.`);
 				}
 				const overReopened = Object.entries(loop.reopenCounts).find(([, count]) => count >= REOPEN_LIMIT);
 				if (overReopened) {
-					return finish(ctx, `stuck: ${overReopened[0]} was reopened ${overReopened[1]} times. Check its evidence yourself.`, "warning");
+					return finish(
+						ctx,
+						`stuck: ${overReopened[0]} was reopened ${overReopened[1]} times. Check its evidence yourself.`,
+						"warning",
+						`Stopped: ${overReopened[0]} keeps failing. Take a look.`,
+					);
 				}
-				if (verdict.verdict === "stuck") return finish(ctx, `stuck: ${verdict.reason}`, "warning");
+				if (verdict.verdict === "stuck") return finish(ctx, `stuck: ${verdict.reason}`, "warning", `Stopped, stuck: ${short(verdict.reason, 100)}`);
 			}
 
 			const contextAction = loop.contextPolicy === "manager" ? (verdict?.context ?? "keep") : loop.contextPolicy;
@@ -941,22 +959,18 @@ export default function serefManager(pi: ExtensionAPI): void {
 			} else if (contextAction === "reset" && !(await resetSession(ctx, loop))) {
 				return;
 			}
-			const counts = countItems(snapshot);
 			const ticked = changes.filter(change => change.item.state === "done").map(change => change.item.id);
 			phone(
 				loop,
 				2,
 				["bar_chart"],
-				[
-					`Iteration ${loop.iteration}: ${ticked.length > 0 ? `ticked ${ticked.join(", ")}` : "no item ticked"}${reviewNote ? `; manager: ${reviewNote}` : ""}.`,
-					`${counts.done} done, ${counts.blocked} blocked, ${counts.open} open of ${counts.total}.`,
-				].join(" "),
+				`Round ${loop.iteration}: ${ticked.length > 0 ? `finished ${ticked.join(", ")}` : "nothing finished"}. ${tallyText(snapshot)}.${reviewNote}`,
 			);
 			startIteration(ctx, loop, snapshot, notes);
 		} catch (error) {
 			const quota = error instanceof UsageDepletedError ? error : usageLimitError(error);
 			if (quota && state === loop && !loop.paused) void enterQuotaWait(ctx, loop, "manager", quota);
-			else if (state === loop && !loop.paused) pause(ctx, `${errorText(error)}. Loop paused; /seref_manager resume retries.`);
+			else if (state === loop && !loop.paused) pause(ctx, `${errorText(error)}. Loop paused; /seref_manager resume retries.`, "Paused: the manager hit an error. Open omp to resume.");
 		} finally {
 			loop.busy = false;
 		}
@@ -1013,7 +1027,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		);
 		ctx.ui.notify(`seref_manager answered ask: ${lines.join(" | ")}`, "info");
 		for (const answer of answers) {
-			phone(loop, 2, ["speech_balloon"], `Decided for you: ${answer.question} → ${choiceOf(answer)}${answer.why ? ` (${answer.why})` : ""}`);
+			phone(loop, 2, ["speech_balloon"], `Picked "${short(choiceOf(answer), 60)}" for: ${short(answer.question, 80)}`);
 		}
 		const results = answers.map((answer, index) => ({
 			id: answer.id,
@@ -1217,7 +1231,12 @@ export default function serefManager(pi: ExtensionAPI): void {
 		);
 		loop.history = [...loop.history, `- audit: ${summary}`].slice(-HISTORY_KEEP);
 		ctx.ui.notify(`seref_manager: audit done: ${summary}. ${verdict.summary}`, reopened.length > 0 ? "warning" : "info");
-		phone(loop, reopened.length > 0 ? 3 : 2, ["mag"], `Audit of earlier ticks: ${summary}. ${verdict.summary}`);
+		phone(
+			loop,
+			reopened.length > 0 ? 3 : 2,
+			["mag"],
+			`Checked earlier work: ${reopened.length > 0 ? `${reopened.length} sent back to redo` : "all good"}${unblocked.length > 0 ? `, ${unblocked.length} unstuck` : ""}.`,
+		);
 		return edited.applied.map(
 			edit => `- ${edit.id} ${edit.kind === "reopen" ? "was reopened by the manager's audit" : "blocker was rejected by the manager's audit"}: ${edit.reason}`,
 		);
@@ -1230,14 +1249,18 @@ export default function serefManager(pi: ExtensionAPI): void {
 			if (state !== loop || loop.paused) return;
 			loop.audited = true;
 			const gate = await runGate(loop);
-			if (gate.code === 0) return finish(ctx, `gate passes after the audit (${gate.summary}); nothing left to run.`, "info");
-			if (gate.code !== 1) return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error");
+			if (gate.code === 0) return finish(ctx, `gate passes after the audit (${gate.summary}); nothing left to run.`, "info", "All done! Nothing left to do.");
+			if (gate.code !== 1) return finish(ctx, `gate error, exit ${gate.code}: ${gate.summary}. Loop stopped.`, "error", "Stopped: the task list file has a problem.");
 			startIteration(ctx, loop, parseLedger(await Bun.file(loop.ledgerPath).text()), notes);
 		} catch (error) {
 			const quota = error instanceof UsageDepletedError ? error : usageLimitError(error);
 			if (quota && state === loop && !loop.paused) void enterQuotaWait(ctx, loop, "audit", quota);
 			else if (state === loop && !loop.paused) {
-				pause(ctx, `audit failed: ${errorText(error)}. /seref_manager resume retries it; run with --no-audit to skip it.`);
+				pause(
+					ctx,
+					`audit failed: ${errorText(error)}. /seref_manager resume retries it; run with --no-audit to skip it.`,
+					"Paused: checking earlier work failed. Open omp to resume.",
+				);
 			}
 		}
 	};
@@ -1315,8 +1338,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 				.join("\n"),
 			"info",
 		);
-		phone(loop, 2, ["arrow_forward"], `Started: ${gate.summary}. Manager ${modelName}.${audit ? ` Auditing ${unsupervised} earlier tick(s) first.` : ""}`);
-		announceLoop(loop, gate.summary);
+		phone(loop, 2, ["arrow_forward"], `Started. ${tallyText(snapshot)}.${audit ? " Checking earlier work first." : ""}`);
+		announceLoop(loop);
 		startWatchdog(ctx, loop);
 		if (audit) {
 			persist(loop);
@@ -1344,7 +1367,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 						return;
 					case "pause":
 						if (!state) throw new Error("no loop is running");
-						pause(ctx, "paused. /seref_manager resume continues.", false);
+						pause(ctx, "paused. /seref_manager resume continues.");
 						return;
 					case "resume": {
 						const loop = state;
@@ -1368,7 +1391,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 					}
 					case "stop":
 						if (!state) throw new Error("no loop is running");
-						finish(ctx, "stopped by the user.", "info", false);
+						finish(ctx, "stopped by the user.", "info");
 						return;
 					case "away": {
 						const loop = state;
@@ -1407,8 +1430,8 @@ export default function serefManager(pi: ExtensionAPI): void {
 						const targets = [...new Set([config.topic, ...(loopChannel ? [loopChannel] : [])])];
 						for (const topic of targets) {
 							const failure = await publishNtfy(config, topic, {
-								title: `${path.basename(ctx.cwd)} · seref_manager`,
-								message: `Test notification for ${topic === config.topic ? "the general channel" : "this loop's channel"} from ${os.hostname()}.`,
+								title: path.basename(ctx.cwd),
+								message: `Test from ${os.hostname()}: ${topic === config.topic ? "general channel" : "this loop's channel"} works.`,
 								priority: 3,
 								tags: ["bell"],
 							});
@@ -1497,7 +1520,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		if (!loop || loop.paused || loop.quotaWait || event.willContinue) return;
 		const last = lastAssistant(event.messages);
 		if (last?.stopReason === "aborted") {
-			pause(ctx, "interrupted, loop paused. /seref_manager resume continues, /seref_manager stop ends it.", false);
+			pause(ctx, "interrupted, loop paused. /seref_manager resume continues, /seref_manager stop ends it.");
 			return;
 		}
 		if (last?.stopReason === "error") {
@@ -1506,7 +1529,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 				void enterQuotaWait(ctx, loop, "worker", quota);
 				return;
 			}
-			pause(ctx, "the worker's turn ended with an error, loop paused. /seref_manager resume retries.");
+			pause(ctx, "the worker's turn ended with an error, loop paused. /seref_manager resume retries.", "Paused: the AI hit an error. Open omp to resume.");
 			return;
 		}
 		ctx.setTimeout(() => advance(ctx), 0);
@@ -1544,13 +1567,13 @@ export default function serefManager(pi: ExtensionAPI): void {
 			const until = formatClock(Date.now() + event.delayMs, Date.now());
 			ctx.ui.setStatus("seref_manager", `seref ${loop.iteration}/${loop.max} · usage limit, omp retries at ${until}`);
 			log(loop, `omp is waiting out a usage limit inside iteration ${loop.iteration}; it retries at ${new Date(Date.now() + event.delayMs).toISOString()}.`);
-			phone(loop, 3, ["hourglass_flowing_sand"], `Usage limit hit inside iteration ${loop.iteration}; omp retries at ${until} by itself.`);
+			phone(loop, 3, ["hourglass_flowing_sand"], `Hit the AI usage limit. Continues at ${until} by itself.`);
 			return;
 		}
 		if (event.attempt >= 3 && !loop.stalls.has("requests")) {
 			loop.stalls.add("requests");
 			log(loop, `Requests failing: attempt ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`);
-			phone(loop, 3, ["satellite"], `Model requests are failing (attempt ${event.attempt}/${event.maxAttempts}): ${event.errorMessage.slice(0, 300)}`);
+			phone(loop, 3, ["satellite"], "AI requests keep failing. Still retrying.");
 		}
 	});
 
@@ -1560,7 +1583,7 @@ export default function serefManager(pi: ExtensionAPI): void {
 		if (loop) {
 			updateStatus(ctx);
 			loop.ompWaitUntil = undefined;
-			if (event.success && loop.stalls.delete("requests")) phone(loop, 2, ["arrow_forward"], "Model requests work again.");
+			if (event.success && loop.stalls.delete("requests")) phone(loop, 2, ["arrow_forward"], "AI requests work again.");
 		}
 		const waitMs = event.success ? undefined : ompWaitFromFinalError(event.finalError);
 		ompGiveUp = waitMs !== undefined ? { waitMs, at: Date.now() } : undefined;

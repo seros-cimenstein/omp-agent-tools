@@ -110,7 +110,7 @@ test("the outbox keeps messages through an outage and delivers them, marked dela
 	await outbox.send(cfg, "general", { ...event, message: "new loop" });
 	expect(delivered).toEqual([
 		{ topic: "general", message: "new loop" },
-		{ topic: "horus-abc", message: "(delayed, from 10:15) stuck" },
+		{ topic: "horus-abc", message: "From 10:15: stuck" },
 	]);
 	expect(outbox.pending).toBe(0);
 });

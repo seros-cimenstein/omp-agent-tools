@@ -198,7 +198,7 @@ export async function ntfyQuotaLine(config: NtfyConfig): Promise<string> {
 
 /**
  * Sends events, keeping the ones that could not be delivered (network down, rate limit) and
- * delivering them, marked as delayed, after the next send that works. Below `minPriority`
+ * delivering them, prefixed with their original time, after the next send that works. Below `minPriority`
  * nothing is sent; scheduled (sequence id) messages are never queued, since they are re-sent anyway.
  */
 export class NtfyOutbox {
@@ -231,7 +231,7 @@ export class NtfyOutbox {
 	async flush(config: NtfyConfig): Promise<void> {
 		while (this.#pending.length > 0) {
 			const [next] = this.#pending;
-			const delayed = { ...next.event, message: `(delayed, from ${new Date(next.failedAt).toTimeString().slice(0, 5)}) ${next.event.message}` };
+			const delayed = { ...next.event, message: `From ${new Date(next.failedAt).toTimeString().slice(0, 5)}: ${next.event.message}` };
 			if (await this.publish(config, next.topic, delayed)) return;
 			this.#pending.shift();
 		}
