@@ -37,7 +37,10 @@ in every double-brace placeholder; none may remain.
   - Every finding the user asked to fix gets an item; never drop one silently.
 - **Decisions**: where a fix has materially different options, pick the conservative default and
   write it into the item. List every such choice in your reply so the user can veto it
-  (by marking that item `- [!] … — BLOCKED: user veto`) before starting.
+  (by marking that item `- [!] … — BLOCKED: user veto`) before starting. When a rule reserves a
+  choice for the user (or "the operator"), still write the default and the options, and have the
+  worker call `ask`: under `/seref_manager` the manager decides for the user. Never write "if
+  deferred or undecided, mark it blocked".
 
 ## 3. Prove the gate
 From the repo root, run `~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate LOOP_<SLUG>.md`.
@@ -61,9 +64,10 @@ Write it in this order:
    - The loop ends only when the gate exits 0. A DONE claim with open or unproven items is
      rejected and the loop keeps going; a missing or broken ledger stops it with an error.
    - After each iteration the manager reviews it: reopens ticks the transcript does not back,
-     rejects weak blockers, answers questions, steers the next iteration, compacts when useful,
-     and stops the loop as stuck when only the user can unblock it.
-   - `ask` dialogs get 2 minutes for you, then the manager answers or defers them
+     rejects weak blockers, decides open questions and blockers that only wait for a decision,
+     steers the next iteration, compacts when useful, and stops the loop as stuck only when a
+     credential, a host or a manual step from the user is missing.
+   - `ask` dialogs get 2 minutes for you, then the manager decides for you
      (`--grace SECONDS`, or `/seref_manager away` to skip the wait).
    - Esc pauses; `/seref_manager resume` continues, `/seref_manager stop` ends it. Decisions are
      logged to `LOOP_<SLUG>.manager.md`.

@@ -23,12 +23,14 @@ every `- [!]` a `BLOCKED:` reason.
 6. Edit this file: `- [ ]` -> `- [x]` and append ` — DONE: <files>; <test/smoke evidence>`.
    One item per iteration is fine; finish an item completely or leave it `- [ ]`.
 7. Blocked only for a user decision or an unreachable host/credential. For a decision, call the `ask`
-   tool; nobody may be at the keyboard, so under `/seref_manager` the loop manager answers it or
-   tells you to defer. Never end a turn waiting for a reply. Mark a blocker
-   `- [!] … — BLOCKED: <exact missing thing, what was tried>`. Difficulty, size or scope pressure
-   is not a blocker.
+   tool; nobody may be at the keyboard, so under `/seref_manager` the loop manager decides it for the
+   user, and its answer is the user's decision (also where a rule reserves a choice for the user or
+   operator): act on it instead of marking the item blocked. Never end a turn waiting for a reply.
+   Mark a blocker `- [!] … — BLOCKED: <exact missing thing, what was tried>`. Difficulty, size or
+   scope pressure is not a blocker.
    A `— MANAGER(itN): …` note is the loop manager's review: an item it reopened stays open until
-   you fix what the note names and tick it again with new evidence.
+   you fix what the note names and tick it again with new evidence; a decision in the note is the
+   user's decision.
 8. When no `- [ ]` is left: run every test suite and {{FINAL CHECK}}, replace the STATUS line with
    `STATUS: DONE`, append a summary (done / invalid / blocked) at the bottom, then run the gate
    command above. It must exit 0; if it does not, fix what its message names before yielding.
