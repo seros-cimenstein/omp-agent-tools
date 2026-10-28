@@ -1,0 +1,117 @@
+<!--
+  Layered layout reference for /diagramify (style: card.svg; rules: ~/.omp/agent/RULES.md "SVG diagrams").
+  Grid: viewBox 960 wide. Band = rect.core x=20 w=920 rx=14, stroke set inline (--c2, --accent, --success),
+        title class .h at top-right (x=924, text-anchor end) or top-left (x=36) where no arrow crosses it.
+  Boxes: w=250 at x=40 / 355 / 670 (65 px gaps hold arrow labels); two-column box: x=40 w=565.
+        h=90: heading at y+23, up to 3 detail lines at y+43, y+60, y+77 (about 32 characters each).
+  Rows inside a band: 22 px apart. Bands: 20 px apart; arrows between bands cross the gap, labels sit in it.
+  Arrows: solid = does/orders, dashed (.dash) = what comes back, both markers = two-way.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 680" font-family="Noto Sans, DejaVu Sans, Liberation Sans, sans-serif">
+  <style>
+    .t{font-family:Noto Sans, DejaVu Sans, Liberation Sans, sans-serif;font-weight:600;font-size:19px;fill:var(--fg)}
+    .s{font-family:Noto Sans, DejaVu Sans, Liberation Sans, sans-serif;font-size:13px;fill:var(--fg);fill-opacity:0.8}
+    .h{font-family:Noto Sans, DejaVu Sans, Liberation Sans, sans-serif;font-weight:600;font-size:14px;fill:var(--fg)}
+    .d{font-family:Noto Sans, DejaVu Sans, Liberation Sans, sans-serif;font-size:11.5px;fill:var(--fg);fill-opacity:0.82}
+    .l{font-family:Noto Sans, DejaVu Sans, Liberation Sans, sans-serif;font-size:11px;fill:var(--fg)}
+    .box{fill:var(--fg);fill-opacity:0.05;stroke:var(--fg);stroke-opacity:0.45;stroke-width:1.2}
+    .core{fill:none;stroke:var(--accent);stroke-width:2}
+    .ln{stroke:var(--fg);stroke-opacity:0.75;stroke-width:1.5;fill:none}
+    .dash{stroke-dasharray:5 4}
+    .ah{fill:var(--fg);fill-opacity:0.75}
+  </style>
+  <defs>
+    <marker id="a" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto-start-reverse">
+      <path class="ah" d="M0,0 L9,4.5 L0,9 z"/>
+    </marker>
+  </defs>
+
+  <text class="t" x="480" y="34" text-anchor="middle">HORUS — an AI commander for ArduPilot drones</text>
+  <text class="s" x="480" y="57" text-anchor="middle">Three layers: a remote LLM decides what to do, the onboard core flies it, ArduPilot keeps the drone safe.</text>
+  <rect class="core" x="20" y="78" width="920" height="134" rx="14" style="stroke:var(--c2)"/>
+  <text class="h" x="924" y="98" text-anchor="end" style="fill:var(--c2)">Remote · decides</text>
+  <rect class="box" x="40" y="108" width="250" height="92" rx="10"/>
+  <text class="h" x="165" y="131" text-anchor="middle">Commander LLM</text>
+  <text class="d" x="165" y="151" text-anchor="middle">Claude Code, Anthropic or OpenAI</text>
+  <text class="d" x="165" y="168" text-anchor="middle">one chat per mission</text>
+  <text class="d" x="165" y="185" text-anchor="middle">picks targets + bounded skills</text>
+  <rect class="box" x="355" y="108" width="250" height="92" rx="10"/>
+  <text class="h" x="480" y="131" text-anchor="middle">Operator</text>
+  <text class="d" x="480" y="151" text-anchor="middle">types a mission in the REPL</text>
+  <text class="d" x="480" y="168" text-anchor="middle">e.g. follow the hiker in red</text>
+  <text class="d" x="480" y="185" text-anchor="middle">emergency stop skips the model</text>
+  <rect class="box" x="670" y="108" width="250" height="92" rx="10"/>
+  <text class="h" x="795" y="131" text-anchor="middle">Gazebo GUI panels</text>
+  <text class="d" x="795" y="151" text-anchor="middle">raw drone camera</text>
+  <text class="d" x="795" y="168" text-anchor="middle">what the LLM was shown</text>
+  <text class="d" x="795" y="185" text-anchor="middle">events + status</text>
+  <line class="ln" x1="353" y1="140" x2="292" y2="140" marker-end="url(#a)"/>
+  <text class="l" x="322" y="133" text-anchor="middle">mission</text>
+  <line class="ln" x1="607" y1="140" x2="668" y2="140" marker-end="url(#a)"/>
+  <text class="l" x="637" y="133" text-anchor="middle">watches</text>
+  <rect class="core" x="20" y="232" width="920" height="248" rx="14" style="stroke:var(--accent)"/>
+  <text class="h" x="924" y="252" text-anchor="end" style="fill:var(--accent)">HORUS core · onboard, flies the skills</text>
+  <rect class="box" x="40" y="264" width="250" height="90" rx="10"/>
+  <text class="h" x="165" y="287" text-anchor="middle">MCP server</text>
+  <text class="d" x="165" y="307" text-anchor="middle">authenticated HTTP, loopback only</text>
+  <text class="d" x="165" y="324" text-anchor="middle">skills · camera frames · events</text>
+  <text class="d" x="165" y="341" text-anchor="middle">state · emergency controls</text>
+  <rect class="box" x="355" y="264" width="250" height="90" rx="10"/>
+  <text class="h" x="480" y="287" text-anchor="middle">Executor</text>
+  <text class="d" x="480" y="307" text-anchor="middle">goto · move · turn · look</text>
+  <text class="d" x="480" y="324" text-anchor="middle">approach · follow · orbit</text>
+  <text class="d" x="480" y="341" text-anchor="middle">scan · search · run_plan</text>
+  <rect class="box" x="670" y="264" width="250" height="90" rx="10"/>
+  <text class="h" x="795" y="287" text-anchor="middle">Lost-target belief</text>
+  <text class="d" x="795" y="307" text-anchor="middle">400 walker particles</text>
+  <text class="d" x="795" y="324" text-anchor="middle">people trails + map prior</text>
+  <text class="d" x="795" y="341" text-anchor="middle">guesses where it went</text>
+  <rect class="box" x="40" y="376" width="250" height="90" rx="10"/>
+  <text class="h" x="165" y="399" text-anchor="middle">Grounder service</text>
+  <text class="d" x="165" y="419" text-anchor="middle">Grounding DINO / OWLv2</text>
+  <text class="d" x="165" y="436" text-anchor="middle">finds things by description</text>
+  <text class="d" x="165" y="453" text-anchor="middle">runs on loopback</text>
+  <rect class="box" x="355" y="376" width="250" height="90" rx="10"/>
+  <text class="h" x="480" y="399" text-anchor="middle">Perception</text>
+  <text class="d" x="480" y="419" text-anchor="middle">YOLOv8n + CSRT tracks</text>
+  <text class="d" x="480" y="436" text-anchor="middle">OSNet re-ID embeddings</text>
+  <text class="d" x="480" y="453" text-anchor="middle">numbered set-of-mark frames</text>
+  <rect class="box" x="670" y="376" width="250" height="90" rx="10"/>
+  <text class="h" x="795" y="399" text-anchor="middle">Flight link</text>
+  <text class="d" x="795" y="419" text-anchor="middle">pymavlink telemetry</text>
+  <text class="d" x="795" y="436" text-anchor="middle">velocity setpoints only</text>
+  <text class="d" x="795" y="453" text-anchor="middle">link lost: hold, then RTH</text>
+  <line class="ln" x1="190" y1="202" x2="190" y2="262" marker-end="url(#a)"/>
+  <text class="l" x="198" y="225" text-anchor="start">tool calls</text>
+  <line class="ln dash" x1="140" y1="262" x2="140" y2="202" marker-end="url(#a)"/>
+  <text class="l" x="132" y="225" text-anchor="end">events</text>
+  <line class="ln" x1="292" y1="300" x2="353" y2="300" marker-end="url(#a)"/>
+  <text class="l" x="322" y="293" text-anchor="middle">skills</text>
+  <line class="ln dash" x1="668" y1="300" x2="607" y2="300" marker-end="url(#a)"/>
+  <text class="l" x="637" y="293" text-anchor="middle">chase</text>
+  <line class="ln" x1="292" y1="420" x2="353" y2="420" marker-end="url(#a)"/>
+  <text class="l" x="322" y="413" text-anchor="middle">boxes</text>
+  <line class="ln" x1="480" y1="374" x2="480" y2="357" marker-end="url(#a)"/>
+  <text class="l" x="488" y="369" text-anchor="start">tracks</text>
+  <line class="ln" x1="607" y1="350" x2="668" y2="385" marker-end="url(#a)"/>
+  <rect class="core" x="20" y="504" width="920" height="120" rx="14" style="stroke:var(--success)"/>
+  <text class="h" x="36" y="524" style="fill:var(--success)">Safety + vehicle</text>
+  <rect class="box" x="40" y="534" width="565" height="80" rx="10"/>
+  <text class="h" x="322.5" y="557" text-anchor="middle">Vehicle &amp; world</text>
+  <text class="d" x="322.5" y="577" text-anchor="middle">Gazebo Harmonic + ArduCopter SITL · forest, urban and procedural worlds</text>
+  <text class="d" x="322.5" y="594" text-anchor="middle">or GTA V as the camera renderer · ToF range sensors · heavy runs on Laptop</text>
+  <rect class="box" x="670" y="534" width="250" height="80" rx="10"/>
+  <text class="h" x="795" y="557" text-anchor="middle">ArduPilot Copter</text>
+  <text class="d" x="795" y="577" text-anchor="middle">stabilization · obstacle avoidance</text>
+  <text class="d" x="795" y="594" text-anchor="middle">failsafes · RC pilot override</text>
+  <line class="ln" x1="820" y1="468" x2="820" y2="532" marker-end="url(#a)"/>
+  <text class="l" x="828" y="500" text-anchor="start">velocity cmds</text>
+  <line class="ln dash" x1="770" y1="532" x2="770" y2="468" marker-end="url(#a)"/>
+  <text class="l" x="762" y="500" text-anchor="end">telemetry</text>
+  <line class="ln" x1="480" y1="532" x2="480" y2="468" marker-end="url(#a)"/>
+  <text class="l" x="488" y="500" text-anchor="start">video</text>
+  <line class="ln" x1="607" y1="574" x2="668" y2="574" marker-start="url(#a)" marker-end="url(#a)"/>
+  <text class="l" x="637" y="567" text-anchor="middle">motors</text>
+  <text class="s" x="480" y="650" text-anchor="middle">Safety rule: HORUS sends only velocity setpoints, so ArduPilot’s obstacle avoidance stays in charge.</text>
+  <text class="s" x="480" y="668" text-anchor="middle">The LLM only supervises: if its link drops, the drone holds, then returns home.</text>
+</svg>
