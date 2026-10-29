@@ -57,7 +57,10 @@
 </head>
 <body>
 <div class="bar" id="tools">
-	<button id="eraser" title="Eraser (E)">🧽</button>
+	<div class="group">
+		<button id="pen" title="Pen (P)">✏️</button>
+		<button id="eraser" title="Eraser (E)">🧽</button>
+	</div>
 	<div class="group" id="colors"></div>
 	<input id="width" type="range" min="1" max="24" step="1" title="Line width">
 	<div class="sep"></div>
@@ -536,6 +539,7 @@ function setTool(t) {
 	tool = t;
 	$("tool").innerHTML = t === "grab" ? '✋<span class="wide">Grab</span>' : '✏️<span class="wide">Pen</span>';
 	$("tool").classList.toggle("on", t === "grab");
+	$("pen").classList.toggle("on", t === "pen");
 	$("eraser").classList.toggle("on", t === "eraser");
 	paper.classList.toggle("grab", t === "grab");
 }
@@ -576,6 +580,7 @@ for (const c of COLORS) {
 }
 $("tool").onclick = () => setTool(tool === "grab" ? "pen" : "grab");
 $("eraser").onclick = () => setTool(tool === "eraser" ? "pen" : "eraser");
+$("pen").onclick = () => setTool("pen");
 $("width").value = String(width);
 $("width").oninput = e => { width = Number(e.target.value); persist(); };
 $("undo").onclick = undo;
