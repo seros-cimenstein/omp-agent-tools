@@ -19,7 +19,7 @@ Restart omp. Nothing listens on the network until you run `/sketch`.
 | `/sketch url` | Only print the links |
 | `request_sketch` tool | The agent asks for a drawing and waits; the canvas shows its question, **Answer** replies |
 
-On the canvas: **Send** starts a turn when the agent is idle; while it works, **⏳ Follow-up / ⚡ Steer** picks whether the drawing waits or interrupts. **✏️ Pen / ✋ Grab** (next to the status) switches drawing vs moving the page; two fingers always pan and zoom. 🧽 eraser, colours, width, undo/redo, 🖼️ or Ctrl+V to annotate an image, 📊 to pick a chat diagram, 📱 for a QR code to open it on a phone.
+On the canvas: **Send** starts a turn when the agent is idle; while it works, the drawing waits until the current run finishes. **✏️ Pen / ✋ Grab** (next to the status) switches drawing vs moving the page; two fingers always pan and zoom. 🧽 eraser, colours, width, undo/redo, 🖼️ or Ctrl+V to annotate an image, 📊 to pick a chat diagram, 📱 for a QR code to open it on a phone.
 
 ## Phone access
 

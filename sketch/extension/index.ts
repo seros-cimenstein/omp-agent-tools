@@ -3,7 +3,7 @@
  *
  * - `/sketch` starts a token-gated HTTP server (port 7878, LAN-reachable) and opens the canvas.
  * - Send from the canvas → `pi.sendUserMessage` with the PNG; starts a turn when idle, otherwise
- *   follows up or steers per the page's toggle.
+ *   queues as a follow-up after the current run.
  * - `request_sketch` tool lets the agent ask for a drawing and wait for it.
  * - `/sketch diagram` (or the canvas's 📊 button) puts the latest ```svg diagram from the chat
  *   (e.g. /diagramify) on the canvas to mark up.
@@ -54,10 +54,9 @@ function deliver(sketch: Sketch): string {
 		{ type: "image" as const, data: sketch.data, mimeType: sketch.mimeType },
 	];
 	Promise.resolve()
-		.then(() => pi.sendUserMessage(content, idle ? undefined : { deliverAs: sketch.mode }))
+		.then(() => pi.sendUserMessage(content, idle ? undefined : { deliverAs: "followUp" }))
 		.catch(err => ctx.ui.notify(`Sketch delivery failed: ${err instanceof Error ? err.message : err}`, "error"));
-	if (idle) return "started";
-	return sketch.mode === "steer" ? "steered" : "queued";
+	return idle ? "started" : "queued";
 }
 
 function decline(): boolean {

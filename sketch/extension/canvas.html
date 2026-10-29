@@ -84,10 +84,6 @@
 </div>
 <div class="bar bottom">
 	<textarea id="note" placeholder="Note (optional)" rows="1"></textarea>
-	<div class="group" title="What Send does while the agent is working">
-		<button id="mode-followUp" data-mode="followUp">⏳<span class="wide">Follow-up</span></button>
-		<button id="mode-steer" data-mode="steer">⚡<span class="wide">Steer</span></button>
-	</div>
 	<button id="send" title="Send (Ctrl+Enter)">Send</button>
 	<button id="tool" title="Switch pen / grab (grab moves the drawing)"></button>
 	<span class="pill"><span class="dot" id="dot"></span><span id="status">connecting…</span></span>
@@ -129,8 +125,7 @@ const saved = JSON.parse(localStorage.getItem("omp-sketch") || "{}");
 let tool = "pen";
 let color = COLORS.includes(saved.color) ? saved.color : COLORS[0];
 let width = Number(saved.width) || 4;
-let mode = saved.mode === "steer" ? "steer" : "followUp";
-const persist = () => localStorage.setItem("omp-sketch", JSON.stringify({ color, width, mode }));
+const persist = () => localStorage.setItem("omp-sketch", JSON.stringify({ color, width }));
 
 /** Document in "doc units"; strokes are vectors in these units, rendered at any scale. */
 let doc = { w: 1, h: 1 };
@@ -551,13 +546,6 @@ function setColor(c) {
 	persist();
 }
 
-function setMode(m) {
-	mode = m;
-	$("mode-followUp").classList.toggle("on", m === "followUp");
-	$("mode-steer").classList.toggle("on", m === "steer");
-	persist();
-}
-
 function updateButtons() {
 	$("undo").disabled = !undoStack.length;
 	$("redo").disabled = !redoStack.length;
@@ -566,7 +554,6 @@ function updateButtons() {
 	$("send").textContent = sending ? "Sending…" : answering ? "Answer" : "Send";
 	$("send").classList.toggle("answer", answering);
 	$("send").disabled = sending || !connected;
-	$("mode-followUp").disabled = $("mode-steer").disabled = answering;
 }
 
 for (const c of COLORS) {
@@ -587,8 +574,6 @@ $("undo").onclick = undo;
 $("redo").onclick = redo;
 $("clear").onclick = clearAll;
 $("fit").onclick = fit;
-$("mode-followUp").onclick = () => setMode("followUp");
-$("mode-steer").onclick = () => setMode("steer");
 $("send").onclick = send;
 $("decline").onclick = decline;
 $("file").onchange = e => {
@@ -666,7 +651,6 @@ function blobToBase64(blob) {
 const SENT_MESSAGES = {
 	started: "Sent ✓ agent is on it",
 	queued: "Queued ✓ agent will see it after the current run",
-	steered: "Sent ✓ steering the current run",
 	answered: "Answered ✓",
 };
 
@@ -680,7 +664,7 @@ async function send() {
 		const res = await fetch(api("/send"), {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ data, mimeType: "image/png", note: $("note").value, mode }),
+			body: JSON.stringify({ data, mimeType: "image/png", note: $("note").value }),
 		});
 		const body = await res.json().catch(() => ({}));
 		if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
@@ -753,7 +737,6 @@ $("diagrams-close").onclick = () => $("diagrams").close();
 
 // ---------- boot ----------
 setColor(color);
-setMode(mode);
 doc = stageDoc();
 resizeInk();
 new ResizeObserver(resizePaper).observe(stage);

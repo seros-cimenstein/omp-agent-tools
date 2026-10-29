@@ -4,14 +4,11 @@ import type { Server } from "bun";
 import type { Diagram } from "./diagrams";
 import { qrSvg } from "./qr";
 
-export type DeliveryMode = "followUp" | "steer";
-
 export interface Sketch {
 	/** Base64 image bytes, no data: prefix. */
 	data: string;
 	mimeType: "image/png" | "image/jpeg";
 	note: string;
-	mode: DeliveryMode;
 }
 
 /** What the canvas page shows about the agent. */
@@ -126,14 +123,13 @@ function json(body: unknown, status = 200): Response {
 
 function parseSketch(body: unknown): Sketch | string {
 	if (!body || typeof body !== "object") return "Body must be a JSON object";
-	const { data, mimeType, note, mode } = body as Record<string, unknown>;
+	const { data, mimeType, note } = body as Record<string, unknown>;
 	if (typeof data !== "string" || data.length === 0) return "Missing image data";
 	if (data.length > MAX_IMAGE_B64) return "Image too large";
 	if (!/^[A-Za-z0-9+/]+=*$/.test(data)) return "Image data must be plain base64";
 	if (mimeType !== "image/png" && mimeType !== "image/jpeg") return "mimeType must be image/png or image/jpeg";
 	if (note !== undefined && typeof note !== "string") return "note must be a string";
-	if (mode !== "followUp" && mode !== "steer") return "mode must be followUp or steer";
-	return { data, mimeType, note: (note ?? "").trim(), mode };
+	return { data, mimeType, note: (note ?? "").trim() };
 }
 
 export function startSketchServer(token: string, hooks: SketchHooks): SketchServer {
