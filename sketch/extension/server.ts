@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Server } from "bun";
@@ -50,7 +51,9 @@ const MAX_IMAGE_B64 = 24 * 1024 * 1024;
 const HEARTBEAT_MS = 15_000;
 const VIRTUAL_IFACE = /^(lo|docker|br-|virbr|veth|vmnet|vboxnet|cloudflarewarp|warp|zt|podman|cni|flannel)/i;
 const PHYSICAL_IFACE = /^(wl|en|eth)/i;
-const PAGE_PATH = path.join(import.meta.dir, "canvas.html");
+// Read once with the rest of the extension code, so a running omp never serves a page newer than
+// the server it talks to (edits apply on the next omp start, like the .ts files).
+const PAGE = fs.readFileSync(path.join(import.meta.dir, "canvas.html"), "utf8");
 
 interface LanAddress {
 	iface: string;
@@ -152,7 +155,7 @@ export function startSketchServer(token: string, hooks: SketchHooks): SketchServ
 		if (url.searchParams.get("t") !== token) return new Response("Forbidden", { status: 403 });
 
 		if (req.method === "GET" && url.pathname === "/") {
-			return new Response(Bun.file(PAGE_PATH), {
+			return new Response(PAGE, {
 				headers: {
 					"Content-Type": "text/html; charset=utf-8",
 					"Cache-Control": "no-store",

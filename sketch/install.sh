@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install sketch into omp: link extension/ into the user extensions directory, so edits
-# in this repo take effect on the next omp start (canvas.html on the next page reload).
+# in this repo (including canvas.html) take effect on the next omp start.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 dest_dir="${PI_CODING_AGENT_DIR:-$HOME/.omp/agent}/extensions"
