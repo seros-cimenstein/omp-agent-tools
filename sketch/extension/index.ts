@@ -78,8 +78,15 @@ function ensureServer(): SketchServer {
 	return server;
 }
 
+const CHROMIUM_BINARIES = ["chromium", "google-chrome-stable", "google-chrome", "brave"];
+
+/**
+ * Opens the canvas in a new Chromium window, so the window manager puts it on the current
+ * workspace; xdg-open would add a tab to whichever Chromium window already exists.
+ */
 function openBrowser(url: string): void {
-	const cmd = process.platform === "darwin" ? ["open", url] : ["xdg-open", url];
+	const chromium = process.platform === "darwin" ? undefined : CHROMIUM_BINARIES.find(bin => Bun.which(bin));
+	const cmd = chromium ? [chromium, "--new-window", url] : process.platform === "darwin" ? ["open", url] : ["xdg-open", url];
 	try {
 		Bun.spawn(cmd, { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
 	} catch {}
