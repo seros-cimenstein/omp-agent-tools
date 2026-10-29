@@ -1,45 +1,48 @@
 /**
  * Finds ```svg diagrams (e.g. from /diagramify) in the session's assistant messages and
- * re-themes them for white paper: the chat SVGs colour themselves with the reader's theme
- * variables (`var(--fg)`, `currentColor`), which mean nothing outside omp's renderer.
+ * themes them dark: the chat SVGs colour themselves with the reader's theme variables
+ * (`var(--fg)`, `currentColor`), which mean nothing outside omp's renderer, so they are
+ * resolved to the titanium palette /diagramify checks its renders against.
  */
 
 export interface Diagram {
 	id: string;
 	title: string;
-	/** Standalone, paper-themed SVG ready to load as an image. */
+	/** Standalone, dark-themed SVG ready to load as an image (transparent; paint `background` under it). */
 	svg: string;
+	background: string;
 }
 
 const MAX_DIAGRAMS = 12;
 const SVG_BLOCK = /```svg[^\n]*\n([\s\S]*?)```/g;
+const BACKGROUND = "#242424";
 
-/** Dark-on-white stand-ins for omp's theme variables. */
-const PAPER: Record<string, string> = {
-	fg: "#1d2330",
-	muted: "#5b6472",
-	border: "#9aa3b2",
-	surface: "#eef2f7",
-	accent: "#0077cc",
-	success: "#0a8f55",
-	warning: "#c46a00",
-	error: "#d62839",
-	c1: "#0077cc",
-	c2: "#c2185b",
-	c3: "#2e7d32",
-	c4: "#6a4fc4",
-	c5: "#c46a00",
-	c6: "#00897b",
+/** Titanium theme values for omp's theme variables. */
+const DARK: Record<string, string> = {
+	fg: "#e8ecf4",
+	muted: "#9aa3b2",
+	border: "#4a4f59",
+	surface: "#2e3138",
+	accent: "#00b4ff",
+	success: "#00ff88",
+	warning: "#ffb347",
+	error: "#ff4757",
+	c1: "#00b4ff",
+	c2: "#ff6fb0",
+	c3: "#7ddc6a",
+	c4: "#c39bff",
+	c5: "#ffb347",
+	c6: "#5ce0d0",
 };
 
-function themeForPaper(svg: string): string {
-	let out = svg.replace(/var\(\s*--([\w-]+)\s*(?:,[^)]*)?\)/g, (_, name: string) => PAPER[name] ?? PAPER.fg);
+function themeDark(svg: string): string {
+	let out = svg.replace(/var\(\s*--([\w-]+)\s*(?:,[^)]*)?\)/g, (_, name: string) => DARK[name] ?? DARK.fg);
 	const open = out.match(/<svg\b[^>]*>/);
 	if (!open) return out;
 	let tag = open[0];
 	// `<img>`-loaded SVG needs the namespace; `currentColor` resolves against `color`.
 	if (!/\sxmlns=/.test(tag)) tag = tag.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
-	if (!/\scolor=/.test(tag)) tag = tag.replace("<svg", `<svg color="${PAPER.fg}"`);
+	if (!/\scolor=/.test(tag)) tag = tag.replace("<svg", `<svg color="${DARK.fg}"`);
 	out = out.replace(open[0], tag);
 	return out;
 }
@@ -83,7 +86,7 @@ export function findDiagrams(entries: readonly unknown[]): Diagram[] {
 			const id = Bun.hash(source).toString(36);
 			if (seen.has(id)) continue;
 			seen.add(id);
-			found.push({ id, title: titleOf(source), svg: themeForPaper(source) });
+			found.push({ id, title: titleOf(source), svg: themeDark(source), background: BACKGROUND });
 		}
 	}
 	return found;

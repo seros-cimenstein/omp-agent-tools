@@ -19,7 +19,7 @@ Restart omp. Nothing listens on the network until you run `/sketch`.
 | `/sketch url` | Only print the links |
 | `request_sketch` tool | The agent asks for a drawing and waits; the canvas shows its question, **Answer** replies |
 
-On the canvas: **Send** starts a turn when the agent is idle; while it works, the drawing waits until the current run finishes. **✏️ Pen / ✋ Grab** (next to the status) switches drawing vs moving the page; two fingers always pan and zoom. 🧽 eraser, colours, width, undo/redo, 🖼️ or Ctrl+V to annotate an image, 📊 to pick a chat diagram, 📱 for a QR code to open it on a phone.
+On the canvas: **Send** starts a turn when the agent is idle; while it works, the drawing waits until the current run finishes. **✏️ Pen / ✋ Grab** (next to the status) switches drawing vs moving the page; two fingers always pan and zoom. 🧽 eraser, colours, width, undo/redo, 🖼️ or Ctrl+V to annotate an image, 📊 to pick a chat diagram (shown in the dark titanium palette; the pen switches to white ink), 📱 for a QR code to open it on a phone.
 
 ## Phone access
 
@@ -36,5 +36,5 @@ sudo ufw allow from 192.168.1.0/24 to any port 7878 proto tcp
 - `extension/index.ts`: omp wiring: `/sketch`, `request_sketch`, delivery via `sendUserMessage`, lifecycle
 - `extension/server.ts`: Bun HTTP server, token gate, live status (SSE), LAN addresses, firewall hint
 - `extension/canvas.html`: the drawing page (no dependencies, works offline)
-- `extension/diagrams.ts`: finds chat SVG diagrams and recolours them for white paper
+- `extension/diagrams.ts`: finds chat SVG diagrams and resolves their theme colours to the dark titanium palette
 - `extension/qr.ts`: QR code encoder
