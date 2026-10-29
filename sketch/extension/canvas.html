@@ -1,0 +1,768 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>omp sketch</title>
+<style>
+	:root {
+		--bg: #1d1f24; --panel: #272a31; --line: #3a3e47; --fg: #e8ecf4; --dim: #9aa3b2;
+		--accent: #00b4ff; --ok: #00d27a; --warn: #ffb347; --err: #ff4757;
+		color-scheme: dark;
+	}
+	* { box-sizing: border-box; }
+	html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.3 system-ui, sans-serif; overscroll-behavior: none; }
+	body { display: flex; flex-direction: column; height: 100dvh; user-select: none; -webkit-user-select: none; }
+	.bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
+	.bar.bottom { border-top: 1px solid var(--line); border-bottom: 0; padding-bottom: max(6px, env(safe-area-inset-bottom)); }
+	.group { display: flex; gap: 4px; align-items: center; }
+	.sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 2px; }
+	button, .btn { min-width: 40px; height: 40px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: #30343c; color: var(--fg); font: inherit; cursor: pointer; touch-action: manipulation; display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
+	button:disabled { opacity: .4; cursor: default; }
+	button.on { border-color: var(--accent); background: #10364a; }
+	.swatch { width: 32px; min-width: 32px; height: 32px; padding: 0; border-radius: 50%; border: 2px solid transparent; }
+	.swatch.on { border-color: var(--fg); box-shadow: 0 0 0 2px var(--accent); background-clip: padding-box; }
+	input[type=range] { width: 90px; accent-color: var(--accent); }
+	#stage { flex: 1; position: relative; min-height: 0; overflow: hidden; }
+	#paper { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; cursor: crosshair; }
+	#paper.grab { cursor: grab; }
+	#paper.grab:active { cursor: grabbing; }
+	#note { flex: 1 1 200px; min-width: 140px; height: 40px; max-height: 120px; resize: vertical; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: #1a1c20; color: var(--fg); font: inherit; user-select: text; -webkit-user-select: text; }
+	#send { background: var(--accent); border-color: var(--accent); color: #001522; font-weight: 600; padding: 0 18px; }
+	#send.answer { background: var(--warn); border-color: var(--warn); }
+	.pill { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; white-space: nowrap; }
+	.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); }
+	.dot.idle { background: var(--ok); } .dot.busy { background: var(--warn); } .dot.off { background: var(--err); }
+	#banner { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); max-width: min(92%, 640px); display: none; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 10px; background: #3a2f12; border: 1px solid var(--warn); color: var(--fg); box-shadow: 0 6px 20px #0008; z-index: 2; }
+	#banner.show { display: flex; }
+	#banner b { color: var(--warn); }
+	#toast { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); width: max-content; max-width: 92%; padding: 8px 14px; border-radius: 8px; background: #000c; color: var(--fg); text-align: center; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 2; }
+	#toast.show { opacity: 1; }
+	#toast.err { color: var(--err); }
+	dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--fg); max-width: min(92vw, 420px); padding: 16px; }
+	dialog::backdrop { background: #000a; }
+	dialog img { width: 100%; max-width: 300px; display: block; margin: 10px auto; image-rendering: pixelated; border-radius: 6px; }
+	dialog select { width: 100%; height: 36px; background: #1a1c20; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; }
+	dialog code { display: block; word-break: break-all; font-size: 12px; background: #1a1c20; padding: 8px; border-radius: 6px; user-select: all; -webkit-user-select: all; margin-top: 6px; }
+	.hint { color: var(--dim); font-size: 12px; margin-top: 10px; }
+	#diagrams { max-width: min(92vw, 640px); }
+	.thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 10px; max-height: 60vh; overflow: auto; }
+	.thumbs button { height: auto; flex-direction: column; align-items: stretch; padding: 6px; }
+	.thumbs img { width: 100%; max-width: none; margin: 0; aspect-ratio: 16 / 10; object-fit: contain; background: #fff; image-rendering: auto; }
+	.thumbs span { font-size: 12px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	#file { display: none; }
+	@media (max-width: 560px) { .wide { display: none; } input[type=range] { width: 70px; } }
+</style>
+</head>
+<body>
+<div class="bar" id="tools">
+	<button id="eraser" title="Eraser (E)">🧽</button>
+	<div class="group" id="colors"></div>
+	<input id="width" type="range" min="1" max="24" step="1" title="Line width">
+	<div class="sep"></div>
+	<div class="group">
+		<button id="undo" title="Undo (Ctrl+Z)">↶</button>
+		<button id="redo" title="Redo (Ctrl+Shift+Z)">↷</button>
+		<button id="clear" title="Clear canvas">🗑️</button>
+	</div>
+	<div class="sep"></div>
+	<div class="group">
+		<label class="btn" title="Insert image to annotate (or paste with Ctrl+V)">🖼️<span class="wide">Image</span><input id="file" type="file" accept="image/*"></label>
+		<button id="diagram" title="Mark up a diagram from the chat (/diagramify)">📊<span class="wide">Diagram</span></button>
+		<button id="fit" title="Fit to screen">⤢</button>
+		<button id="phone" title="Open on phone / tablet">📱</button>
+	</div>
+</div>
+<div id="stage">
+	<canvas id="paper"></canvas>
+	<div id="banner"><span>🙋 <b>Agent asks:</b> <span id="ask"></span></span><button id="decline">Decline</button></div>
+	<div id="toast"></div>
+</div>
+<div class="bar bottom">
+	<textarea id="note" placeholder="Note (optional)" rows="1"></textarea>
+	<div class="group" title="What Send does while the agent is working">
+		<button id="mode-followUp" data-mode="followUp">⏳<span class="wide">Follow-up</span></button>
+		<button id="mode-steer" data-mode="steer">⚡<span class="wide">Steer</span></button>
+	</div>
+	<button id="send" title="Send (Ctrl+Enter)">Send</button>
+	<button id="tool" title="Switch pen / grab (grab moves the drawing)"></button>
+	<span class="pill"><span class="dot" id="dot"></span><span id="status">connecting…</span></span>
+</div>
+<dialog id="diagrams">
+	<div><b>Diagrams from this omp session</b></div>
+	<div class="hint" style="margin-top:4px">Newest first. Pick one to draw on it.</div>
+	<div class="thumbs" id="diagram-list"></div>
+	<div style="display:flex;justify-content:flex-end;margin-top:12px"><button id="diagrams-close">Close</button></div>
+</dialog>
+<dialog id="qr">
+	<div><b>Open on another device</b></div>
+	<div class="hint" style="margin-top:4px">Scan with a phone or tablet on the same network.</div>
+	<select id="qr-url" style="margin-top:10px"></select>
+	<img id="qr-img" alt="QR code">
+	<code id="qr-text"></code>
+	<div id="qr-fw" class="hint" hidden>Firewall is active. If the phone can't connect, run:<code id="qr-fw-cmd"></code></div>
+	<div style="display:flex;justify-content:flex-end;margin-top:12px"><button id="qr-close">Close</button></div>
+</dialog>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const token = new URLSearchParams(location.search).get("t") || "";
+const api = p => `${p}${p.includes("?") ? "&" : "?"}t=${encodeURIComponent(token)}`;
+
+const EXPORT_LONG_SIDE = 1568;
+const MAX_INK_SIDE = 3072;
+const MAX_BG_SIDE = 2048;
+const HISTORY_LIMIT = 200;
+const COLORS = ["#111111", "#e53935", "#1e88e5", "#43a047", "#fb8c00", "#8e24aa"];
+
+const paper = $("paper");
+const view2d = paper.getContext("2d");
+const stage = $("stage");
+const ink = document.createElement("canvas");
+const ink2d = ink.getContext("2d");
+
+const saved = JSON.parse(localStorage.getItem("omp-sketch") || "{}");
+let tool = "pen";
+let color = COLORS.includes(saved.color) ? saved.color : COLORS[0];
+let width = Number(saved.width) || 4;
+let mode = saved.mode === "steer" ? "steer" : "followUp";
+const persist = () => localStorage.setItem("omp-sketch", JSON.stringify({ color, width, mode }));
+
+/** Document in "doc units"; strokes are vectors in these units, rendered at any scale. */
+let doc = { w: 1, h: 1 };
+let bg = null;
+let strokes = [];
+const undoStack = [];
+const redoStack = [];
+let view = { s: 1, x: 0, y: 0 };
+let userZoomed = false;
+let inkScale = 1;
+let dpr = 1;
+let agent = { busy: false, request: null };
+let connected = false;
+let sending = false;
+
+// ---------- rendering ----------
+const pressureFactor = p => 0.3 + 1.4 * p;
+
+function applyStrokeStyle(ctx, s) {
+	ctx.globalCompositeOperation = s.tool === "eraser" ? "destination-out" : "source-over";
+	ctx.strokeStyle = ctx.fillStyle = s.color;
+	ctx.lineCap = "round";
+	ctx.lineJoin = "round";
+}
+
+/**
+ * Draws midpoint-smoothed segments `from`..end; `final` adds the tail (or a dot for a tap).
+ * Consecutive segments of equal (quantised) width share one path, so joins have no overdraw seams.
+ */
+function drawSegments(ctx, s, from, final) {
+	applyStrokeStyle(ctx, s);
+	const P = s.pts;
+	const n = P.length / 3;
+	const w = s.tool === "eraser" ? s.width * 4 : s.width;
+	const widthAt = i => Math.round(w * pressureFactor(P[i * 3 + 2]) * 4) / 4;
+	if (final && n === 1) {
+		ctx.beginPath();
+		ctx.arc(P[0], P[1], widthAt(0) / 2, 0, Math.PI * 2);
+		ctx.fill();
+		return;
+	}
+	let pathWidth = -1;
+	const segment = (lw, x0, y0) => {
+		if (lw === pathWidth) return;
+		if (pathWidth >= 0) ctx.stroke();
+		pathWidth = lw;
+		ctx.lineWidth = lw;
+		ctx.beginPath();
+		ctx.moveTo(x0, y0);
+	};
+	for (let k = Math.max(1, from); k < n; k++) {
+		const c = (k - 1) * 3;
+		segment(widthAt(k - 1), k === 1 ? P[0] : (P[c - 3] + P[c]) / 2, k === 1 ? P[1] : (P[c - 2] + P[c + 1]) / 2);
+		ctx.quadraticCurveTo(P[c], P[c + 1], (P[c] + P[c + 3]) / 2, (P[c + 1] + P[c + 4]) / 2);
+	}
+	if (final && n > 1) {
+		const l = (n - 1) * 3;
+		segment(widthAt(n - 1), (P[l - 3] + P[l]) / 2, (P[l - 2] + P[l + 1]) / 2);
+		ctx.lineTo(P[l], P[l + 1]);
+	}
+	if (pathWidth >= 0) ctx.stroke();
+}
+
+function resizeInk() {
+	inkScale = Math.min(MAX_INK_SIDE / Math.max(doc.w, doc.h), Math.max(2, (window.devicePixelRatio || 1) * 2));
+	ink.width = Math.max(1, Math.round(doc.w * inkScale));
+	ink.height = Math.max(1, Math.round(doc.h * inkScale));
+}
+
+function rebuildInk() {
+	ink2d.setTransform(1, 0, 0, 1, 0, 0);
+	ink2d.globalCompositeOperation = "source-over";
+	ink2d.clearRect(0, 0, ink.width, ink.height);
+	ink2d.setTransform(inkScale, 0, 0, inkScale, 0, 0);
+	for (const s of strokes) drawSegments(ink2d, s, 1, true);
+	requestRender();
+}
+
+let frame = 0;
+function requestRender() {
+	if (!frame) frame = requestAnimationFrame(render);
+}
+
+function render() {
+	frame = 0;
+	const c = view2d;
+	c.setTransform(1, 0, 0, 1, 0, 0);
+	c.globalCompositeOperation = "source-over";
+	c.fillStyle = "#2a2d33";
+	c.fillRect(0, 0, paper.width, paper.height);
+	c.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.x, dpr * view.y);
+	c.shadowColor = "#0008";
+	c.shadowBlur = 12;
+	c.fillStyle = "#fff";
+	c.fillRect(0, 0, doc.w, doc.h);
+	c.shadowBlur = 0;
+	c.imageSmoothingQuality = "high";
+	if (bg) c.drawImage(bg, 0, 0, doc.w, doc.h);
+	c.drawImage(ink, 0, 0, doc.w, doc.h);
+}
+
+function fit() {
+	const r = stage.getBoundingClientRect();
+	const s = Math.min(r.width / doc.w, r.height / doc.h) * 0.96;
+	view = { s, x: (r.width - doc.w * s) / 2, y: (r.height - doc.h * s) / 2 };
+	userZoomed = false;
+	requestRender();
+}
+
+function resizePaper() {
+	dpr = window.devicePixelRatio || 1;
+	const r = stage.getBoundingClientRect();
+	paper.width = Math.max(1, Math.round(r.width * dpr));
+	paper.height = Math.max(1, Math.round(r.height * dpr));
+	if (!userZoomed) fit();
+	else requestRender();
+}
+
+function stageDoc() {
+	const r = stage.getBoundingClientRect();
+	return { w: Math.max(200, Math.round(r.width)), h: Math.max(200, Math.round(r.height)) };
+}
+
+// ---------- history ----------
+const snapshot = () => ({ strokes: strokes.slice(), bg, doc: { ...doc } });
+
+function commit(prev) {
+	undoStack.push(prev);
+	if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+	redoStack.length = 0;
+	updateButtons();
+}
+
+function restore(state) {
+	const docChanged = state.doc.w !== doc.w || state.doc.h !== doc.h;
+	strokes = state.strokes.slice();
+	bg = state.bg;
+	doc = { ...state.doc };
+	if (docChanged) {
+		resizeInk();
+		fit();
+	}
+	rebuildInk();
+	updateButtons();
+}
+
+function undo() {
+	if (!undoStack.length) return;
+	redoStack.push(snapshot());
+	restore(undoStack.pop());
+}
+
+function redo() {
+	if (!redoStack.length) return;
+	undoStack.push(snapshot());
+	restore(redoStack.pop());
+}
+
+function clearAll() {
+	if (!strokes.length && !bg) return;
+	const prev = snapshot();
+	strokes = [];
+	bg = null;
+	doc = stageDoc();
+	resizeInk();
+	fit();
+	rebuildInk();
+	commit(prev);
+}
+
+/** `source`: an image Blob/File, or an already-decoded ImageBitmap. */
+async function setBackground(source, label = "Image") {
+	let bitmap = source;
+	if (!(source instanceof ImageBitmap)) {
+		try {
+			bitmap = await createImageBitmap(source);
+		} catch {
+			return toast("That file isn't an image this browser can read", true);
+		}
+	}
+	if (strokes.length && !confirm("Replace the current drawing with this image?")) return;
+	const prev = snapshot();
+	const k = Math.min(1, MAX_BG_SIDE / Math.max(bitmap.width, bitmap.height));
+	doc = { w: Math.round(bitmap.width * k), h: Math.round(bitmap.height * k) };
+	bg = bitmap;
+	strokes = [];
+	resizeInk();
+	fit();
+	rebuildInk();
+	commit(prev);
+	toast(`${label} added — draw on top`);
+}
+
+/** Rasterises an SVG string at MAX_BG_SIDE on its long side (viewBox wins over intrinsic size). */
+async function rasterizeSvg(svg) {
+	const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+	try {
+		const img = new Image();
+		img.src = url;
+		await img.decode();
+		const vb = svg.match(/viewBox\s*=\s*["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/);
+		const w = vb ? Number(vb[1]) : img.naturalWidth;
+		const h = vb ? Number(vb[2]) : img.naturalHeight;
+		if (!w || !h) throw new Error("SVG has no size");
+		const k = MAX_BG_SIDE / Math.max(w, h);
+		const c = document.createElement("canvas");
+		c.width = Math.round(w * k);
+		c.height = Math.round(h * k);
+		c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+		return await createImageBitmap(c);
+	} finally {
+		URL.revokeObjectURL(url);
+	}
+}
+
+async function loadDiagram(diagram) {
+	let bitmap;
+	try {
+		bitmap = await rasterizeSvg(diagram.svg);
+	} catch (err) {
+		return toast(`Couldn't render that diagram: ${err.message}`, true);
+	}
+	await setBackground(bitmap, `"${diagram.title}"`);
+}
+
+async function fetchDiagrams() {
+	const res = await fetch(api("/diagrams")).catch(() => null);
+	if (!res?.ok) {
+		toast("omp is not reachable", true);
+		return null;
+	}
+	return res.json();
+}
+
+async function openDiagrams() {
+	const list = await fetchDiagrams();
+	if (!list) return;
+	if (!list.length) return toast("No diagrams in this session yet. Run /diagramify first.", true);
+	$("diagram-list").replaceChildren(
+		...list.map(d => {
+			const b = document.createElement("button");
+			const img = document.createElement("img");
+			img.src = URL.createObjectURL(new Blob([d.svg], { type: "image/svg+xml" }));
+			img.onload = () => URL.revokeObjectURL(img.src);
+			img.alt = d.title;
+			const t = document.createElement("span");
+			t.textContent = d.title;
+			b.title = d.title;
+			b.append(img, t);
+			b.onclick = () => {
+				$("diagrams").close();
+				loadDiagram(d);
+			};
+			return b;
+		}),
+	);
+	$("diagrams").showModal();
+}
+
+// ---------- input ----------
+const pointers = new Map();
+let active = null; // { id, stroke, prev }
+let gesture = null; // { startDist, startMid, startView }
+let penSeen = false;
+
+function toDoc(clientX, clientY) {
+	const r = paper.getBoundingClientRect();
+	return [(clientX - r.left - view.x) / view.s, (clientY - r.top - view.y) / view.s];
+}
+
+function addPoints(e) {
+	const s = active.stroke;
+	const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+	for (const ev of events.length ? events : [e]) {
+		const [x, y] = toDoc(ev.clientX, ev.clientY);
+		const p = ev.pointerType === "pen" && ev.pressure > 0 ? ev.pressure : 0.5;
+		const n = s.pts.length;
+		if (n && Math.hypot(x - s.pts[n - 3], y - s.pts[n - 2]) < 0.4 / view.s) continue;
+		s.pts.push(x, y, p);
+	}
+	const count = s.pts.length / 3;
+	drawSegments(ink2d, s, active.drawn, false);
+	active.drawn = count;
+	requestRender();
+}
+
+function startStroke(e) {
+	// Width is what the user sees on screen at the current zoom; export scales it with the drawing.
+	const strokeWidth = width / view.s;
+	active = { id: e.pointerId, drawn: 1, stroke: { tool, color, width: strokeWidth, pts: [] } };
+	addPoints(e);
+}
+
+function endStroke(cancelled) {
+	const done = active;
+	active = null;
+	if (!done || cancelled || done.stroke.pts.length === 0) {
+		rebuildInk();
+		return;
+	}
+	const prev = snapshot();
+	strokes.push(done.stroke);
+	commit(prev);
+	rebuildInk();
+}
+
+function touchList() {
+	return [...pointers.values()].filter(p => p.type === "touch");
+}
+
+function beginGesture() {
+	const [a, b] = touchList();
+	gesture = {
+		startDist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+		startMid: [(a.x + b.x) / 2, (a.y + b.y) / 2],
+		startView: { ...view },
+	};
+}
+
+function updateGesture() {
+	const touches = touchList();
+	if (touches.length < 2) return;
+	const [a, b] = touches;
+	const r = paper.getBoundingClientRect();
+	const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+	const mid = [(a.x + b.x) / 2, (a.y + b.y) / 2];
+	const g = gesture;
+	const s = Math.min(20, Math.max(0.1, g.startView.s * (dist / g.startDist)));
+	const docX = (g.startMid[0] - r.left - g.startView.x) / g.startView.s;
+	const docY = (g.startMid[1] - r.top - g.startView.y) / g.startView.s;
+	view = { s, x: mid[0] - r.left - docX * s, y: mid[1] - r.top - docY * s };
+	userZoomed = true;
+	requestRender();
+}
+
+function startPan(e) {
+	gesture = { pan: [e.clientX, e.clientY, view.x, view.y], id: e.pointerId };
+}
+
+paper.addEventListener("pointerdown", e => {
+	paper.setPointerCapture(e.pointerId);
+	pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: e.pointerType });
+	if (e.pointerType === "pen") penSeen = true;
+	if (e.pointerType === "touch") {
+		const touches = touchList().length;
+		if (touches >= 2) {
+			if (active && pointers.get(active.id)?.type === "touch") endStroke(true);
+			beginGesture();
+			return;
+		}
+		if (gesture) return;
+		if (tool === "grab") return startPan(e);
+		if (penSeen) return; // pen in use → fingers only pan/zoom (palm rejection)
+		if (!active) startStroke(e);
+		return;
+	}
+	if (e.button === 1 || (e.button === 0 && tool === "grab")) return startPan(e);
+	if (e.button === 0 && !active) startStroke(e);
+});
+
+paper.addEventListener("pointermove", e => {
+	const p = pointers.get(e.pointerId);
+	if (!p) return;
+	p.x = e.clientX;
+	p.y = e.clientY;
+	if (gesture?.pan) {
+		if (e.pointerId !== gesture.id) return;
+		view.x = gesture.pan[2] + e.clientX - gesture.pan[0];
+		view.y = gesture.pan[3] + e.clientY - gesture.pan[1];
+		userZoomed = true;
+		requestRender();
+		return;
+	}
+	if (gesture) return updateGesture();
+	if (active && active.id === e.pointerId) addPoints(e);
+});
+
+function pointerEnd(e) {
+	if (!pointers.has(e.pointerId)) return;
+	pointers.delete(e.pointerId);
+	if (active && active.id === e.pointerId) endStroke(e.type === "pointercancel");
+	if (gesture?.pan) {
+		if (gesture.id === e.pointerId) gesture = null;
+	} else if (gesture && touchList().length === 0) gesture = null;
+	else if (gesture && touchList().length >= 2) beginGesture();
+}
+paper.addEventListener("pointerup", pointerEnd);
+paper.addEventListener("pointercancel", pointerEnd);
+paper.addEventListener("contextmenu", e => e.preventDefault());
+
+paper.addEventListener("wheel", e => {
+	e.preventDefault();
+	const r = paper.getBoundingClientRect();
+	const mx = e.clientX - r.left;
+	const my = e.clientY - r.top;
+	const s = Math.min(20, Math.max(0.1, view.s * Math.exp(-e.deltaY * 0.0015)));
+	view = { s, x: mx - ((mx - view.x) / view.s) * s, y: my - ((my - view.y) / view.s) * s };
+	userZoomed = true;
+	requestRender();
+}, { passive: false });
+
+document.addEventListener("gesturestart", e => e.preventDefault());
+
+// ---------- toolbar ----------
+function setTool(t) {
+	tool = t;
+	$("tool").innerHTML = t === "grab" ? '✋<span class="wide">Grab</span>' : '✏️<span class="wide">Pen</span>';
+	$("tool").classList.toggle("on", t === "grab");
+	$("eraser").classList.toggle("on", t === "eraser");
+	paper.classList.toggle("grab", t === "grab");
+}
+
+function setColor(c) {
+	color = c;
+	setTool("pen");
+	for (const el of $("colors").children) el.classList.toggle("on", el.dataset.color === c);
+	persist();
+}
+
+function setMode(m) {
+	mode = m;
+	$("mode-followUp").classList.toggle("on", m === "followUp");
+	$("mode-steer").classList.toggle("on", m === "steer");
+	persist();
+}
+
+function updateButtons() {
+	$("undo").disabled = !undoStack.length;
+	$("redo").disabled = !redoStack.length;
+	$("clear").disabled = !strokes.length && !bg;
+	const answering = Boolean(agent.request);
+	$("send").textContent = sending ? "Sending…" : answering ? "Answer" : "Send";
+	$("send").classList.toggle("answer", answering);
+	$("send").disabled = sending || !connected;
+	$("mode-followUp").disabled = $("mode-steer").disabled = answering;
+}
+
+for (const c of COLORS) {
+	const b = document.createElement("button");
+	b.className = "swatch";
+	b.style.background = c;
+	b.dataset.color = c;
+	b.title = c;
+	b.onclick = () => setColor(c);
+	$("colors").append(b);
+}
+$("tool").onclick = () => setTool(tool === "grab" ? "pen" : "grab");
+$("eraser").onclick = () => setTool(tool === "eraser" ? "pen" : "eraser");
+$("width").value = String(width);
+$("width").oninput = e => { width = Number(e.target.value); persist(); };
+$("undo").onclick = undo;
+$("redo").onclick = redo;
+$("clear").onclick = clearAll;
+$("fit").onclick = fit;
+$("mode-followUp").onclick = () => setMode("followUp");
+$("mode-steer").onclick = () => setMode("steer");
+$("send").onclick = send;
+$("decline").onclick = decline;
+$("file").onchange = e => {
+	const f = e.target.files?.[0];
+	if (f) setBackground(f);
+	e.target.value = "";
+};
+
+document.addEventListener("paste", e => {
+	const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith("image/"));
+	if (!item) return;
+	e.preventDefault();
+	setBackground(item.getAsFile());
+});
+stage.addEventListener("dragover", e => e.preventDefault());
+stage.addEventListener("drop", e => {
+	e.preventDefault();
+	const f = [...(e.dataTransfer?.files || [])].find(f => f.type.startsWith("image/"));
+	if (f) setBackground(f);
+});
+
+document.addEventListener("keydown", e => {
+	const mod = e.ctrlKey || e.metaKey;
+	if (mod && e.key === "Enter") { e.preventDefault(); send(); return; }
+	if (e.target === $("note")) return;
+	const key = e.key.toLowerCase();
+	if (mod && key === "z") { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+	else if (mod && key === "y") { e.preventDefault(); redo(); }
+	else if (!mod && key === "p") setTool("pen");
+	else if (!mod && key === "e") setTool("eraser");
+});
+
+let toastTimer = 0;
+function toast(msg, error = false) {
+	const t = $("toast");
+	t.textContent = msg;
+	t.classList.toggle("err", error);
+	t.classList.add("show");
+	clearTimeout(toastTimer);
+	toastTimer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+// ---------- sending ----------
+async function exportPng() {
+	const k = EXPORT_LONG_SIDE / Math.max(doc.w, doc.h);
+	const W = Math.round(doc.w * k);
+	const H = Math.round(doc.h * k);
+	const layer = document.createElement("canvas");
+	layer.width = W;
+	layer.height = H;
+	const l2d = layer.getContext("2d");
+	l2d.setTransform(k, 0, 0, k, 0, 0);
+	for (const s of strokes) drawSegments(l2d, s, 1, true);
+	const out = document.createElement("canvas");
+	out.width = W;
+	out.height = H;
+	const o2d = out.getContext("2d");
+	o2d.fillStyle = "#fff";
+	o2d.fillRect(0, 0, W, H);
+	o2d.imageSmoothingQuality = "high";
+	if (bg) o2d.drawImage(bg, 0, 0, W, H);
+	o2d.drawImage(layer, 0, 0);
+	return new Promise((resolve, reject) => out.toBlob(b => (b ? resolve(b) : reject(new Error("PNG export failed"))), "image/png"));
+}
+
+function blobToBase64(blob) {
+	return new Promise((resolve, reject) => {
+		const r = new FileReader();
+		r.onload = () => resolve(String(r.result).slice(String(r.result).indexOf(",") + 1));
+		r.onerror = () => reject(r.error);
+		r.readAsDataURL(blob);
+	});
+}
+
+const SENT_MESSAGES = {
+	started: "Sent ✓ agent is on it",
+	queued: "Queued ✓ agent will see it after the current run",
+	steered: "Sent ✓ steering the current run",
+	answered: "Answered ✓",
+};
+
+async function send() {
+	if (sending || !connected) return;
+	if (!strokes.length && !bg) return toast("Draw something first", true);
+	sending = true;
+	updateButtons();
+	try {
+		const data = await blobToBase64(await exportPng());
+		const res = await fetch(api("/send"), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ data, mimeType: "image/png", note: $("note").value, mode }),
+		});
+		const body = await res.json().catch(() => ({}));
+		if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+		$("note").value = "";
+		toast(SENT_MESSAGES[body.status] || "Sent ✓");
+	} catch (err) {
+		toast(`Send failed: ${err.message}`, true);
+	} finally {
+		sending = false;
+		updateButtons();
+	}
+}
+
+async function decline() {
+	const res = await fetch(api("/decline"), { method: "POST" }).catch(() => null);
+	if (res?.ok) toast("Declined");
+}
+
+// ---------- live status ----------
+function applyState(state) {
+	agent = state;
+	$("banner").classList.toggle("show", Boolean(state.request));
+	$("ask").textContent = state.request || "";
+	if (state.request) navigator.vibrate?.(80);
+	renderStatus();
+	updateButtons();
+}
+
+let offlineText = "reconnecting…";
+function renderStatus() {
+	$("dot").className = `dot ${connected ? (agent.busy ? "busy" : "idle") : "off"}`;
+	$("status").textContent = connected ? (agent.busy ? "agent working" : "agent idle") : offlineText;
+}
+
+function connect() {
+	const es = new EventSource(api("/events"));
+	es.addEventListener("state", e => applyState(JSON.parse(e.data)));
+	es.addEventListener("diagram", e => loadDiagram(JSON.parse(e.data)));
+	es.onopen = () => { connected = true; renderStatus(); updateButtons(); };
+	es.onerror = () => {
+		connected = false;
+		if (es.readyState === EventSource.CLOSED) offlineText = "session ended: open the new /sketch link";
+		renderStatus();
+		updateButtons();
+	};
+}
+
+// ---------- phone QR ----------
+async function openQr() {
+	const res = await fetch(api("/info")).catch(() => null);
+	if (!res?.ok) return toast("omp is not reachable", true);
+	const info = await res.json();
+	const sel = $("qr-url");
+	sel.replaceChildren(...info.urls.map((u, i) => new Option(u.label, String(i))));
+	sel.value = info.urls.length > 1 ? "1" : "0";
+	const show = () => {
+		$("qr-img").src = api(`/qr.svg?i=${sel.value}`);
+		$("qr-text").textContent = info.urls[Number(sel.value)].url;
+	};
+	sel.onchange = show;
+	show();
+	$("qr-fw").hidden = !info.firewallHint;
+	$("qr-fw-cmd").textContent = info.firewallHint || "";
+	$("qr").showModal();
+}
+$("phone").onclick = openQr;
+$("qr-close").onclick = () => $("qr").close();
+$("diagram").onclick = openDiagrams;
+$("diagrams-close").onclick = () => $("diagrams").close();
+
+// ---------- boot ----------
+setColor(color);
+setMode(mode);
+doc = stageDoc();
+resizeInk();
+new ResizeObserver(resizePaper).observe(stage);
+resizePaper();
+rebuildInk();
+updateButtons();
+connect();
+const initialDiagram = new URLSearchParams(location.search).get("diagram");
+if (initialDiagram) {
+	fetchDiagrams().then(list => {
+		const d = list?.find(x => x.id === initialDiagram);
+		if (d) loadDiagram(d);
+	});
+}
+</script>
+</body>
+</html>
