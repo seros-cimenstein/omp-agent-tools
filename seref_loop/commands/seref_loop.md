@@ -12,7 +12,7 @@ Goal: `$ARGUMENTS`
 - Otherwise: the goal as written.
 - Nothing usable: ask once what the loop should accomplish, then stop.
 
-Toolkit: `~/projects/seref_omp_tools/seref_loop/` (`templates/LEDGER.md`, `bin/seref-loop-gate`;
+Toolkit: `~/.omp/agent/seref_loop/` (`templates/LEDGER.md`, `bin/seref-loop-gate`;
 `README.md` explains the method).
 
 ## 1. Look into it yourself
@@ -43,7 +43,7 @@ in every double-brace placeholder; none may remain.
   deferred or undecided, mark it blocked".
 
 ## 3. Prove the gate
-From the repo root, run `~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate LOOP_<SLUG>.md`.
+From the repo root, run `~/.omp/agent/seref_loop/bin/seref-loop-gate LOOP_<SLUG>.md`.
 It must exit 1 (open). Exit 2 means the ledger is malformed: fix it and run it again.
 
 ## 4. Reply
@@ -58,7 +58,7 @@ Write it in this order:
    extension (running `/seref_manager run` on the ledger later audits whatever this fallback
    ticked):
    ```
-   /loop <ITEMS> --until '~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate LOOP_<SLUG>.md' Read LOOP_<SLUG>.md and follow its Protocol exactly: take the first "- [ ]" item, re-check that the finding still holds, fix it at the root, verify with tests plus a real smoke run, deploy only within the allowed windows, then mark it "- [x] ... — DONE: <evidence>". When no "- [ ]" is left, run every suite and the final check, set "STATUS: DONE", add the summary, and confirm the gate exits 0.
+   /loop <ITEMS> --until '~/.omp/agent/seref_loop/bin/seref-loop-gate LOOP_<SLUG>.md' Read LOOP_<SLUG>.md and follow its Protocol exactly: take the first "- [ ]" item, re-check that the finding still holds, fix it at the root, verify with tests plus a real smoke run, deploy only within the allowed windows, then mark it "- [x] ... — DONE: <evidence>". When no "- [ ]" is left, run every suite and the final check, set "STATUS: DONE", add the summary, and confirm the gate exits 0.
    ```
 3. How the run works, briefly:
    - The loop ends only when the gate exits 0. A DONE claim with open or unproven items is

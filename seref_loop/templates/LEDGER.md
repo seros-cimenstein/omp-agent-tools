@@ -3,7 +3,7 @@
 STATUS: OPEN
 
 Source: {{SOURCE — the findings/plan these items come from, with paths}}. This file is the loop's
-memory and its stop switch: the gate `~/projects/seref_omp_tools/seref_loop/bin/seref-loop-gate {{LEDGER_FILE}}`
+memory and its stop switch: the gate `~/.omp/agent/seref_loop/bin/seref-loop-gate {{LEDGER_FILE}}`
 (run by `/seref_manager run {{LEDGER_FILE}}` or `/loop --until`) stops the loop only when the line
 above reads `STATUS: DONE`, no `- [ ]` is left, every `- [x]` carries `DONE:`/`INVALID:` evidence and
 every `- [!]` a `BLOCKED:` reason.

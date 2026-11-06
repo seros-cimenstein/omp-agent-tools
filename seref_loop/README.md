@@ -67,7 +67,7 @@ The gate prints a one-line summary to stderr, e.g. `OPEN: 3 done, 0 blocked, 23 
 | `templates/LEDGER.md` | ledger skeleton: STATUS line, per-iteration protocol, item format |
 | `bin/seref-loop-gate` | the stop condition for `/loop --until` |
 | `tests/test_gate.sh` | contract test for the gate's exit codes |
-| `install.sh` | links the command into `~/.omp/agent/commands/` (or `$PI_CODING_AGENT_DIR/commands`) |
+| `install.sh` | links the command into `~/.omp/agent/commands/` (or `$PI_CODING_AGENT_DIR/commands`) and this folder to `~/.omp/agent/seref_loop`, the toolkit path the command and the ledger template refer to |
 
 ## Install / test
 
