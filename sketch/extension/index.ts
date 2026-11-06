@@ -2,20 +2,23 @@
  * sketch — draw on a touchscreen/phone canvas and send it straight into the omp session.
  *
  * - `/sketch` starts a token-gated HTTP server (port 7878, LAN-reachable) and opens the canvas.
- * - Send from the canvas → `pi.sendUserMessage` with the PNG; starts a turn when idle, otherwise
- *   queues as a follow-up after the current run.
+ * - Send from the canvas → `pi.sendUserMessage` with the image (vector sends arrive as SVG and are
+ *   rendered to PNG here); starts a turn when idle, otherwise queues as a follow-up after the current run.
  * - `request_sketch` tool lets the agent ask for a drawing and wait for it.
  * - `/sketch diagram` (or the canvas's 📊 button) puts the latest ```svg diagram from the chat
  *   (e.g. /diagramify) on the canvas to mark up.
+ * - `registry.ts` publishes the server and the pending request for local tools (DevDeck+).
  */
 import { randomBytes } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { type Diagram, findDiagrams } from "./diagrams";
 import { type Sketch, type SketchServer, type SketchState, startSketchServer } from "./server";
+import { publish } from "./registry";
 
 type RequestOutcome = Sketch | "declined" | "cancelled";
 
 interface PendingRequest {
+	id: string;
 	prompt: string;
 	settle(outcome: RequestOutcome): void;
 }
@@ -31,7 +34,17 @@ let pending: PendingRequest | undefined;
 let resumeOnStart = false;
 
 const state = (): SketchState => ({ busy, request: pending?.prompt ?? null });
-const pushState = (): void => server?.broadcast("state", state());
+const register = (): void =>
+	publish({
+		pid: process.pid,
+		port: server?.port ?? null,
+		token,
+		request: pending ? { id: pending.id, prompt: pending.prompt } : null,
+	});
+const pushState = (): void => {
+	server?.broadcast("state", state());
+	register();
+};
 
 function deliver(sketch: Sketch): string {
 	if (pending) {
@@ -50,7 +63,8 @@ function deliver(sketch: Sketch): string {
 		idle = !busy;
 	}
 	const content = [
-		{ type: "text" as const, text: sketch.note || "Here's a sketch." },
+		// The vector source lets the agent read exact marks or edit the diagram.
+		{ type: "text" as const, text: (sketch.note || "Here's a sketch.") + (sketch.svgPath ? `\n(SVG source: ${sketch.svgPath})` : "") },
 		{ type: "image" as const, data: sketch.data, mimeType: sketch.mimeType },
 	];
 	Promise.resolve()
@@ -73,7 +87,10 @@ function diagrams(): Diagram[] {
 }
 
 function ensureServer(): SketchServer {
-	server ??= startSketchServer(token, { send: deliver, decline, state, diagrams });
+	if (!server) {
+		server = startSketchServer(token, { send: deliver, decline, state, diagrams });
+		register();
+	}
 	return server;
 }
 
@@ -109,6 +126,7 @@ export default function sketchExtension(pi: ExtensionAPI): void {
 			resumeOnStart = false;
 			ensureServer();
 		}
+		register();
 	};
 
 	pi.on("session_start", (_event, ctx) => bind(ctx));
@@ -136,6 +154,7 @@ export default function sketchExtension(pi: ExtensionAPI): void {
 			server = undefined;
 			resumeOnStart = true;
 		}
+		register();
 	});
 
 	pi.registerCommand("sketch", {
@@ -179,7 +198,7 @@ export default function sketchExtension(pi: ExtensionAPI): void {
 			prompt: z.string().describe("What you want the user to draw; shown on the canvas as a banner"),
 		}),
 		approval: "read",
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			if (pending) {
 				return { content: [{ type: "text", text: "Another sketch request is already waiting for the user." }] };
 			}
@@ -193,6 +212,7 @@ export default function sketchExtension(pi: ExtensionAPI): void {
 				resolve("cancelled");
 			};
 			const request: PendingRequest = {
+				id: toolCallId,
 				prompt: params.prompt,
 				settle(result) {
 					signal?.removeEventListener("abort", onAbort);
@@ -218,11 +238,13 @@ export default function sketchExtension(pi: ExtensionAPI): void {
 			content: [
 				{
 					type: "text" as const,
-					text: outcome.note ? `The user drew this sketch. Their note: ${outcome.note}` : "The user drew this sketch.",
+					text:
+						(outcome.note ? `The user drew this sketch. Their note: ${outcome.note}` : "The user drew this sketch.") +
+						(outcome.svgPath ? `\n(SVG source: ${outcome.svgPath})` : ""),
 				},
 				{ type: "image" as const, data: outcome.data, mimeType: outcome.mimeType },
 			],
-			details: { note: outcome.note },
+			details: { note: outcome.note, svgPath: outcome.svgPath },
 		};
 	}
 }

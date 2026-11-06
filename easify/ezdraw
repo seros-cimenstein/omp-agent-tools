@@ -1,0 +1,103 @@
+#!/usr/bin/env bun
+// ezdraw — preview an /easify mermaid diagram the way the terminal draws it, and lint it.
+//
+//   ezdraw < diagram.mmd        print the terminal drawing, then any rule breaks
+//   echo '…' | ezdraw           same, from a pipe or heredoc
+//
+// Exit 0 = clean, 1 = rule breaks found (drawing still printed), 2 = could not draw.
+// The renderer (beautiful-mermaid) is installed once into ~/.cache/easify on first use.
+
+import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
+const PKG = "beautiful-mermaid@1.1.3";
+const MAX_OUT = 2; // a 3rd arrow out of one box shares a line with its neighbours: labels collide
+const MAX_LABEL = 12; // arrow label characters
+const MAX_BOX = 22; // box label characters, code included
+
+const cache = join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), "easify");
+const entry = join(cache, "node_modules", "beautiful-mermaid");
+if (!existsSync(entry)) {
+	mkdirSync(cache, { recursive: true });
+	const add = Bun.spawnSync(["bun", "add", "--silent", PKG], { cwd: cache, stderr: "inherit" });
+	if (add.exitCode !== 0) {
+		console.error(`ezdraw: could not install ${PKG} into ${cache}`);
+		process.exit(2);
+	}
+}
+const { renderMermaidAscii } = await import(entry);
+
+let src = await Bun.stdin.text();
+const fence = src.match(/```mermaid\s*\n([\s\S]*?)```/);
+if (fence) src = fence[1];
+
+let drawing: string;
+try {
+	drawing = renderMermaidAscii(src, { useAscii: false });
+} catch (e) {
+	console.error(`ezdraw: mermaid did not parse: ${(e as Error).message}`);
+	process.exit(2);
+}
+console.log(drawing);
+
+// Lint the source against the /easify layout rules.
+const problems: string[] = [];
+const node = String.raw`([A-Za-z0-9_]+)\s*(?:\(\[\s*"([^"]*)"\s*\]\)|\[\s*"([^"]*)"\s*\]|\(\s*"([^"]*)"\s*\))?`;
+const edge = new RegExp(String.raw`^\s*${node}\s*(-->|-\.->|==>)\s*(?:\|\s*"([^"]*)"\s*\|)?\s*${node}\s*$`);
+const defLine = new RegExp(String.raw`^\s*${node}\s*$`);
+const seen = new Set<string>();
+const out = new Map<string, number>();
+const into = new Map<string, number>();
+const labels = new Map<string, string>();
+const note = (id: string, a?: string, b?: string, c?: string) => {
+	const l = a ?? b ?? c;
+	if (l !== undefined) labels.set(id, l);
+};
+
+for (const raw of src.split("\n")) {
+	const line = raw.trim();
+	if (!line || /^flowchart\b|^graph\b/.test(line)) continue;
+	if (/^subgraph\b/.test(line)) problems.push("subgraph used: drop it, it draws sideways");
+	const m = line.match(edge);
+	if (m) {
+		const [, from, fa, fb, fc, , label, to, ta, tb, tc] = m;
+		note(from, fa, fb, fc);
+		note(to, ta, tb, tc);
+		if (seen.size > 0 && !seen.has(from))
+			problems.push(`${from} -> ${to}: arrow starts at a box not drawn yet; it will run upward and cross lines. Reverse it (e.g. "${to} reads ${from}") or drop it.`);
+		if (seen.has(to))
+			problems.push(`${from} -> ${to}: ${to} already has an arrow in; a 2nd one crosses other lines. Drop it and mention the link in the steps.`);
+		if (label === undefined) problems.push(`${from} -> ${to}: arrow has no label`);
+		else if (label.length > MAX_LABEL)
+			problems.push(`${from} -> ${to}: label "${label}" is ${label.length} chars (max ${MAX_LABEL})`);
+		seen.add(from);
+		seen.add(to);
+		out.set(from, (out.get(from) ?? 0) + 1);
+		into.set(to, (into.get(to) ?? 0) + 1);
+		continue;
+	}
+	const d = line.match(defLine);
+	if (d) {
+		note(d[1], d[2], d[3], d[4]);
+		seen.add(d[1]);
+		continue;
+	}
+	problems.push(`could not read line: ${line}`);
+}
+
+for (const [id, n] of out)
+	if (n > MAX_OUT) problems.push(`${id}: ${n} arrows leave it (max ${MAX_OUT}); their labels share one line and run together`);
+for (const [id, l] of labels)
+	if (l.length > MAX_BOX) problems.push(`${id}: box label "${l}" is ${l.length} chars (max ${MAX_BOX})`);
+const boxes = [...labels.keys()].filter((id) => id !== "you").length;
+if (boxes > 7) problems.push(`${boxes} boxes besides You (max 7): group some`);
+if (/[^\x00-\x7F]/.test(drawing.replace(/[\u2500-\u257F\u25B2-\u25BC\u25C0-\u25C4\u2190-\u2193]/g, "")))
+	problems.push("non-ASCII text in labels: may draw wider than it counts");
+
+if (problems.length) {
+	console.log("Rule breaks:");
+	for (const p of problems) console.log(`  - ${p}`);
+	process.exit(1);
+}
+console.log("ezdraw: clean");

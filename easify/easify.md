@@ -7,7 +7,7 @@ Explain this project to me like I'm smart but not a programmer.
 Target: `$ARGUMENTS` (empty = whole project; `#abcd` = zoom into that block; a folder or file path = zoom into it).
 
 ## Ground rules
-- Terminal only: answer in this chat. Don't write files, start servers, or open a browser.
+- Terminal only: answer in this chat. Don't write files, start servers, or open a browser (`ezdraw`'s one-time renderer install into `~/.cache/easify` is the exception).
 - Simple first: what it does for a person, then its parts and how they connect. No code-level detail (functions, classes, variables) unless I zoom into a single file.
 - Everyday words. If a tech term is unavoidable, explain it in ≤6 words in brackets, once.
 - Only show connections you actually saw in the files (a script running another, a settings file being read, a service starting something at boot). Never guess from names alone; if unsure, leave it out.
@@ -19,20 +19,25 @@ Target: `$ARGUMENTS` (empty = whole project; `#abcd` = zoom into that block; a f
 4. Pick the 3–7 blocks a newcomer must know about at this level: subfolders, main files, plus "You" and the outside things it touches (phone, wifi, another computer, a website, the operating system). Merge outside things into as few boxes as possible (e.g. one "Laptop's system" box, not three). Leave out boring stuff (assets, build output, licenses, lockfiles). More than 7 candidates → group them; the rest is what zooming is for.
    Zooming into a single file: blocks are the file's main jobs, keyed `<file>::<job-name>`.
 5. Get codes in one call: `ezcode <key> <key> …` with keys = root-relative paths (folders end with `/`), `ext:<short-name>` for outside things, or `<file>::<job-name>`. Use the printed codes exactly. "You" gets no code.
+6. Check the drawing before answering: pipe the mermaid block into `~/.omp/agent/easify/ezdraw` (a heredoc works). It prints the diagram the way the terminal will draw it, then lists rule breaks. Fix every break and rerun until it prints `ezdraw: clean`, and look at the drawing: no label may touch a box edge, cross a line or sit on another arrow's line. Don't paste ezdraw's output into the answer.
 
 ## Output, in this order
 1. **What it is**: 2 sentences max, what it does for whoever uses it.
-2. A diagram:
+2. A diagram, shaped as a tree that grows downward:
    ```mermaid
    flowchart TD
-     you(["You"]) -->|"turn it on"| a["Main script #abcd"]
+     you(["You"]) -->|"turns on"| a["Main script #abcd"]
      a -->|"reads"| b["Settings #ef01"]
-     a -->|"talks to over wifi"| c("Other laptop #2345")
+     a -->|"talks to"| c("Other laptop #2345")
    ```
    - `flowchart TD`, no subgraphs (they render sideways and get too wide).
-   - ≤ 7 boxes (plus "You"); ≤ 3 arrows leaving any box; prefer arrows that flow downward. Crossing lines make the terminal drawing unreadable, so drop minor connections and mention them in the steps instead.
-   - Box label = 1–3 word plain name + space + code. Project parts use `["…"]`; outside things use round `("…")`.
-   - Every arrow gets a 1–4 word everyday label ("starts at boot", "sends taps to", "reads settings from").
+   - ≤ 7 boxes (plus "You").
+   - **≤ 2 arrows leave any box.** A 3rd arrow shares one sideways line with the others and their labels run together.
+   - **Every box has exactly one arrow coming in** ("You" has none). A second way in crosses other lines; drop it and say it in the steps.
+   - **Arrows only point down to a new box.** Write each line as `<box already drawn> --> <new box>`. Never start an arrow at a box that isn't drawn yet. Something outside that feeds the project (a website, a sensor) is drawn as the project part reading it: `a -->|"reads"| feed`, not `feed --> a`.
+   - Too many links for these limits → merge outside things into one box (e.g. "AI and feeds") or move the link into the steps. Don't break the limits.
+   - Box label = 1–3 word plain name + space + code, ≤ 22 characters total. Project parts use `["…"]`; outside things use round `("…")`.
+   - Every arrow gets a 1–2 word everyday label, ≤ 12 characters ("starts", "reads", "sends taps"). Plain ASCII in all labels: no arrows, dashes or emoji.
 3. **Blocks**: one line each, same order as the diagram:
    `#abcd` **Name**: what it does, ≤ 15 words. (`path/`)
 4. **How it plays out**: 3–5 numbered steps of a typical use, naming blocks by code.

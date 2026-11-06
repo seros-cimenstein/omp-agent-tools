@@ -52,17 +52,35 @@
 	.thumbs img { width: 100%; max-width: none; margin: 0; aspect-ratio: 16 / 10; object-fit: contain; background: #fff; image-rendering: auto; }
 	.thumbs span { font-size: 12px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 	#file { display: none; }
-	@media (max-width: 560px) { .wide { display: none; } input[type=range] { width: 70px; } }
+	@media (max-width: 560px), (max-height: 500px) { .wide { display: none; } input[type=range] { width: 70px; } }
+	/* Colours + width: inline on wide screens; on phones one button opens them, so the toolbar is one row. */
+	#tools { position: relative; }
+	#ink-btn { display: none; }
+	#ink-dot { width: 22px; height: 22px; border-radius: 50%; background: var(--ink, #111); border: 2px solid var(--fg); }
+	#ink-pop { display: flex; gap: 6px; align-items: center; }
+	@media (max-width: 560px) {
+		#tools { gap: 4px; }
+		#tools button, #tools .btn { min-width: 34px; padding: 0 4px; }
+		#ink-btn { display: inline-flex; }
+		#ink-pop { display: none; position: absolute; left: 8px; right: 8px; top: calc(100% + 4px); z-index: 3; flex-wrap: wrap; justify-content: center; gap: 10px; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 6px 20px #0008; }
+		#ink-pop.open { display: flex; }
+		#ink-pop input[type=range] { width: 180px; }
+	}
 </style>
 </head>
 <body>
 <div class="bar" id="tools">
 	<div class="group">
 		<button id="pen" title="Pen (P)">✏️</button>
-		<button id="eraser" title="Eraser (E)">🧽</button>
+		<button id="eraser" title="Eraser (E): removes whole strokes">🧽</button>
 	</div>
-	<div class="group" id="colors"></div>
-	<input id="width" type="range" min="1" max="24" step="1" title="Line width">
+	<div class="group" id="ink">
+		<button id="ink-btn" title="Colour and width"><span id="ink-dot"></span></button>
+		<div id="ink-pop">
+			<div class="group" id="colors"></div>
+			<input id="width" type="range" min="1" max="24" step="1" title="Line width">
+		</div>
+	</div>
 	<div class="sep"></div>
 	<div class="group">
 		<button id="undo" title="Undo (Ctrl+Z)">↶</button>
@@ -110,6 +128,8 @@ const token = new URLSearchParams(location.search).get("t") || "";
 const api = p => `${p}${p.includes("?") ? "&" : "?"}t=${encodeURIComponent(token)}`;
 
 const EXPORT_LONG_SIDE = 1568;
+const PNG_BUDGET = 256 * 1024; // bigger PNGs (photos) go as JPEG
+const JPEG_QUALITY = 0.85;
 const MAX_INK_SIDE = 3072;
 const MAX_BG_SIDE = 2048;
 const HISTORY_LIMIT = 200;
@@ -130,6 +150,8 @@ const persist = () => localStorage.setItem("omp-sketch", JSON.stringify({ color,
 /** Document in "doc units"; strokes are vectors in these units, rendered at any scale. */
 let doc = { w: 1, h: 1 };
 let bg = null;
+/** SVG source of `bg` when it is a chat diagram (sent back as vector), else null. */
+let bgSvg = null;
 let strokes = [];
 const undoStack = [];
 const redoStack = [];
@@ -145,7 +167,6 @@ let sending = false;
 const pressureFactor = p => 0.3 + 1.4 * p;
 
 function applyStrokeStyle(ctx, s) {
-	ctx.globalCompositeOperation = s.tool === "eraser" ? "destination-out" : "source-over";
 	ctx.strokeStyle = ctx.fillStyle = s.color;
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
@@ -159,8 +180,7 @@ function drawSegments(ctx, s, from, final) {
 	applyStrokeStyle(ctx, s);
 	const P = s.pts;
 	const n = P.length / 3;
-	const w = s.tool === "eraser" ? s.width * 4 : s.width;
-	const widthAt = i => Math.round(w * pressureFactor(P[i * 3 + 2]) * 4) / 4;
+	const widthAt = i => Math.round(s.width * pressureFactor(P[i * 3 + 2]) * 4) / 4;
 	if (final && n === 1) {
 		ctx.beginPath();
 		ctx.arc(P[0], P[1], widthAt(0) / 2, 0, Math.PI * 2);
@@ -240,6 +260,12 @@ function resizePaper() {
 	const r = stage.getBoundingClientRect();
 	paper.width = Math.max(1, Math.round(r.width * dpr));
 	paper.height = Math.max(1, Math.round(r.height * dpr));
+	// A blank page follows the screen (rotation, keyboard); once drawn on, its size stays.
+	if (!strokes.length && !bg && !active) {
+		doc = stageDoc();
+		resizeInk();
+		rebuildInk();
+	}
 	if (!userZoomed) fit();
 	else requestRender();
 }
@@ -250,7 +276,7 @@ function stageDoc() {
 }
 
 // ---------- history ----------
-const snapshot = () => ({ strokes: strokes.slice(), bg, doc: { ...doc } });
+const snapshot = () => ({ strokes: strokes.slice(), bg, bgSvg, doc: { ...doc } });
 
 function commit(prev) {
 	undoStack.push(prev);
@@ -263,6 +289,7 @@ function restore(state) {
 	const docChanged = state.doc.w !== doc.w || state.doc.h !== doc.h;
 	strokes = state.strokes.slice();
 	bg = state.bg;
+	bgSvg = state.bgSvg;
 	doc = { ...state.doc };
 	if (docChanged) {
 		resizeInk();
@@ -289,6 +316,7 @@ function clearAll() {
 	const prev = snapshot();
 	strokes = [];
 	bg = null;
+	bgSvg = null;
 	doc = stageDoc();
 	resizeInk();
 	fit();
@@ -296,8 +324,8 @@ function clearAll() {
 	commit(prev);
 }
 
-/** `source`: an image Blob/File, or an already-decoded ImageBitmap. */
-async function setBackground(source, label = "Image") {
+/** `source`: an image Blob/File, or an already-decoded ImageBitmap; `svg`: its SVG source, if any. */
+async function setBackground(source, label = "Image", svg = null) {
 	let bitmap = source;
 	if (!(source instanceof ImageBitmap)) {
 		try {
@@ -311,6 +339,7 @@ async function setBackground(source, label = "Image") {
 	const k = Math.min(1, MAX_BG_SIDE / Math.max(bitmap.width, bitmap.height));
 	doc = { w: Math.round(bitmap.width * k), h: Math.round(bitmap.height * k) };
 	bg = bitmap;
+	bgSvg = svg;
 	strokes = [];
 	resizeInk();
 	fit();
@@ -348,7 +377,7 @@ async function loadDiagram(diagram) {
 	} catch (err) {
 		return toast(`Couldn't render that diagram: ${err.message}`, true);
 	}
-	await setBackground(bitmap, `"${diagram.title}"`);
+	await setBackground(bitmap, `"${diagram.title}"`, diagram.svg);
 }
 
 async function fetchDiagrams() {
@@ -387,7 +416,7 @@ async function openDiagrams() {
 
 // ---------- input ----------
 const pointers = new Map();
-let active = null; // { id, stroke, prev }
+let active = null; // { id, drawn, stroke } while drawing, { id, erase: { prev, last } } while erasing
 let gesture = null; // { startDist, startMid, startView }
 let penSeen = false;
 
@@ -413,15 +442,31 @@ function addPoints(e) {
 }
 
 function startStroke(e) {
+	if (tool === "eraser") {
+		active = { id: e.pointerId, erase: { prev: snapshot(), last: null } };
+		return erasePoints(e);
+	}
 	// Width is what the user sees on screen at the current zoom; export scales it with the drawing.
 	const strokeWidth = width / view.s;
-	active = { id: e.pointerId, drawn: 1, stroke: { tool, color, width: strokeWidth, pts: [] } };
+	active = { id: e.pointerId, drawn: 1, stroke: { color, width: strokeWidth, pts: [] } };
 	addPoints(e);
 }
 
 function endStroke(cancelled) {
 	const done = active;
 	active = null;
+	if (done?.erase) {
+		const { prev } = done.erase;
+		if (strokes.length === prev.strokes.length) return; // touched nothing
+		if (cancelled) {
+			// e.g. the first finger of a pinch: put back what it erased
+			strokes = prev.strokes.slice();
+			rebuildInk();
+			return;
+		}
+		commit(prev);
+		return;
+	}
 	if (!done || cancelled || done.stroke.pts.length === 0) {
 		rebuildInk();
 		return;
@@ -430,6 +475,84 @@ function endStroke(cancelled) {
 	strokes.push(done.stroke);
 	commit(prev);
 	rebuildInk();
+}
+
+// ---------- stroke eraser: removes every stroke its path touches, one undo step per drag ----------
+const ERASER_RADIUS = 10; // screen px around the eraser's path
+const strokeBounds = new WeakMap(); // stroke → {x0, y0, x1, y1, half}; strokes never change once drawn
+
+function boundsOf(s) {
+	let b = strokeBounds.get(s);
+	if (!b) {
+		const P = s.pts;
+		b = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity, half: 0 };
+		let p = 0;
+		for (let i = 0; i < P.length; i += 3) {
+			b.x0 = Math.min(b.x0, P[i]);
+			b.x1 = Math.max(b.x1, P[i]);
+			b.y0 = Math.min(b.y0, P[i + 1]);
+			b.y1 = Math.max(b.y1, P[i + 1]);
+			p = Math.max(p, P[i + 2]);
+		}
+		b.half = (s.width * pressureFactor(p)) / 2;
+		strokeBounds.set(s, b);
+	}
+	return b;
+}
+
+function pointSegDist(px, py, ax, ay, bx, by) {
+	const dx = bx - ax;
+	const dy = by - ay;
+	const len = dx * dx + dy * dy;
+	const t = len ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len)) : 0;
+	return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+}
+
+function segDist(ax, ay, bx, by, cx, cy, dx, dy) {
+	const side = (ox, oy, ux, uy, px, py) => (ux - ox) * (py - oy) - (uy - oy) * (px - ox);
+	const crosses =
+		side(ax, ay, bx, by, cx, cy) > 0 !== side(ax, ay, bx, by, dx, dy) > 0 &&
+		side(cx, cy, dx, dy, ax, ay) > 0 !== side(cx, cy, dx, dy, bx, by) > 0;
+	if (crosses) return 0;
+	return Math.min(
+		pointSegDist(ax, ay, cx, cy, dx, dy),
+		pointSegDist(bx, by, cx, cy, dx, dy),
+		pointSegDist(cx, cy, ax, ay, bx, by),
+		pointSegDist(dx, dy, ax, ay, bx, by),
+	);
+}
+
+/** Whether the eraser moving a→b (doc units, `reach` around it) touches stroke `s`. */
+function touches(s, ax, ay, bx, by, reach) {
+	const b = boundsOf(s);
+	const r = reach + b.half;
+	if (Math.max(ax, bx) < b.x0 - r || Math.min(ax, bx) > b.x1 + r || Math.max(ay, by) < b.y0 - r || Math.min(ay, by) > b.y1 + r) {
+		return false;
+	}
+	const P = s.pts;
+	if (P.length === 3) return pointSegDist(P[0], P[1], ax, ay, bx, by) <= r;
+	for (let i = 3; i < P.length; i += 3) {
+		if (segDist(ax, ay, bx, by, P[i - 3], P[i - 2], P[i], P[i + 1]) <= r) return true;
+	}
+	return false;
+}
+
+function erasePoints(e) {
+	const er = active.erase;
+	const reach = ERASER_RADIUS / view.s;
+	const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+	let hit = false;
+	for (const ev of events.length ? events : [e]) {
+		const [x, y] = toDoc(ev.clientX, ev.clientY);
+		const [lx, ly] = er.last ?? [x, y];
+		er.last = [x, y];
+		const kept = strokes.filter(s => !touches(s, lx, ly, x, y, reach));
+		if (kept.length !== strokes.length) {
+			strokes = kept;
+			hit = true;
+		}
+	}
+	if (hit) rebuildInk();
 }
 
 function touchList() {
@@ -500,7 +623,7 @@ paper.addEventListener("pointermove", e => {
 		return;
 	}
 	if (gesture) return updateGesture();
-	if (active && active.id === e.pointerId) addPoints(e);
+	if (active && active.id === e.pointerId) (active.erase ? erasePoints : addPoints)(e);
 });
 
 function pointerEnd(e) {
@@ -543,6 +666,8 @@ function setColor(c) {
 	color = c;
 	setTool("pen");
 	for (const el of $("colors").children) el.classList.toggle("on", el.dataset.color === c);
+	$("ink-btn").style.setProperty("--ink", c);
+	$("ink-pop").classList.remove("open");
 	persist();
 }
 
@@ -570,6 +695,15 @@ $("eraser").onclick = () => setTool(tool === "eraser" ? "pen" : "eraser");
 $("pen").onclick = () => setTool("pen");
 $("width").value = String(width);
 $("width").oninput = e => { width = Number(e.target.value); persist(); };
+$("ink-btn").onclick = () => $("ink-pop").classList.toggle("open");
+// Any touch outside the colour popover closes it (the slider keeps it open while dragging); the
+// closing tap on the page does not draw.
+document.addEventListener("pointerdown", e => {
+	const pop = $("ink-pop");
+	if (!pop.classList.contains("open") || $("ink").contains(e.target)) return;
+	pop.classList.remove("open");
+	if (e.target === paper) e.stopPropagation();
+}, true);
 $("undo").onclick = undo;
 $("redo").onclick = redo;
 $("clear").onclick = clearAll;
@@ -617,8 +751,128 @@ function toast(msg, error = false) {
 }
 
 // ---------- sending ----------
-async function exportPng() {
+// Vector sends (ink, or ink on a chat diagram) go as SVG: a few KB instead of a raster, and the
+// PC renders it for the model. Photos underneath still go as raster.
+const svgNum = v => String(Math.round(v * 10) / 10);
+
+/**
+ * Ramer–Douglas–Peucker on a stroke's [x, y, p] points: drops points within `tol` (doc units) of
+ * the line through their neighbours. Touch input samples every ~0.4 px; most of that is
+ * redundant. Points where the drawn width changes are always kept.
+ */
+function simplify(P, tol, widthAt) {
+	const n = P.length / 3;
+	if (n < 3) return P;
+	const keep = new Uint8Array(n);
+	keep[0] = keep[n - 1] = 1;
+	for (let i = 1; i < n; i++) if (widthAt(i) !== widthAt(i - 1)) keep[i] = keep[i - 1] = 1;
+	const stack = [];
+	for (let a = 0, b = 1; b < n; b++) {
+		if (!keep[b]) continue;
+		if (b - a > 1) stack.push(a, b);
+		a = b;
+	}
+	while (stack.length) {
+		const b = stack.pop();
+		const a = stack.pop();
+		const ax = P[a * 3], ay = P[a * 3 + 1];
+		const dx = P[b * 3] - ax, dy = P[b * 3 + 1] - ay;
+		const len = Math.hypot(dx, dy);
+		let far = -1;
+		let farDist = tol;
+		for (let i = a + 1; i < b; i++) {
+			const px = P[i * 3] - ax, py = P[i * 3 + 1] - ay;
+			const dist = len > 0 ? Math.abs(px * dy - py * dx) / len : Math.hypot(px, py);
+			if (dist > farDist) {
+				far = i;
+				farDist = dist;
+			}
+		}
+		if (far < 0) continue;
+		keep[far] = 1;
+		if (far - a > 1) stack.push(a, far);
+		if (b - far > 1) stack.push(far, b);
+	}
+	const out = [];
+	for (let i = 0; i < n; i++) if (keep[i]) out.push(P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
+	return out;
+}
+
+/**
+ * One stroke as SVG; `tol` is the simplification tolerance. The canvas smooths its dense samples
+ * with tiny curves, so the simplified polyline stays within `tol` of what was drawn. Inline
+ * `!important` styles: a diagram's own CSS (even `path { stroke: … !important }`) applies to the
+ * whole document and must not restyle the ink.
+ */
+function strokeSvg(s, tol) {
+	const widthOf = (pts, i) => Math.round(s.width * pressureFactor(pts[i * 3 + 2]) * 4) / 4;
+	const P = simplify(s.pts, tol, i => widthOf(s.pts, i));
+	const n = P.length / 3;
+	if (n === 1) return `<circle cx="${svgNum(P[0])}" cy="${svgNum(P[1])}" r="${svgNum(widthOf(P, 0) / 2)}" style="fill:${s.color}!important;stroke:none!important"/>`;
+	// One path per run of equal width; segment i-1 → i is drawn at point i-1's width, as on the canvas.
+	let out = "";
+	for (let i = 1; i < n; ) {
+		const lw = widthOf(P, i - 1);
+		let d = `M${svgNum(P[(i - 1) * 3])} ${svgNum(P[(i - 1) * 3 + 1])}`;
+		do {
+			d += `L${svgNum(P[i * 3])} ${svgNum(P[i * 3 + 1])}`;
+			i++;
+		} while (i < n && widthOf(P, i - 1) === lw);
+		out += `<path style="fill:none!important;stroke:${s.color}!important;stroke-width:${lw}!important;stroke-linecap:round!important;stroke-linejoin:round!important" d="${d}"/>`;
+	}
+	return out;
+}
+
+/** The diagram's own <svg> sized to the page, or null when its size can't be known. */
+function nestedDiagram(svg) {
+	const start = svg.search(/<svg[\s>]/i);
+	const end = svg.lastIndexOf("</svg>");
+	if (start < 0 || end < start) return null;
+	const body = svg.slice(start, end + 6);
+	const open = body.match(/^<svg\b[^>]*>/i)[0];
+	let tag = open.replace(/\s(?:x|y|width|height|preserveAspectRatio)\s*=\s*("[^"]*"|'[^']*')/gi, "");
+	if (!/\sviewBox\s*=/i.test(tag)) {
+		const w = open.match(/\swidth\s*=\s*["']\s*([\d.]+)/i);
+		const h = open.match(/\sheight\s*=\s*["']\s*([\d.]+)/i);
+		if (!w || !h) return null;
+		tag = tag.replace(/^<svg/i, `<svg viewBox="0 0 ${w[1]} ${h[1]}"`);
+	}
+	tag = tag.replace(/^<svg/i, `<svg x="0" y="0" width="${doc.w}" height="${doc.h}" preserveAspectRatio="none"`);
+	return tag + body.slice(open.length);
+}
+
+/** The page as SVG (white paper, the diagram, then the ink); null when it has to go as raster. */
+function exportSvg() {
+	if (bg && !bgSvg) return null;
+	const diagram = bgSvg ? nestedDiagram(bgSvg) : "";
+	if (diagram === null) return null;
 	const k = EXPORT_LONG_SIDE / Math.max(doc.w, doc.h);
+	// A third of an exported pixel: invisible in the render the model sees.
+	const tol = 0.33 / k;
+	const ink = strokes.map(s => strokeSvg(s, tol)).join("");
+	return (
+		`<svg xmlns="http://www.w3.org/2000/svg" width="${Math.round(doc.w * k)}" height="${Math.round(doc.h * k)}" viewBox="0 0 ${doc.w} ${doc.h}">` +
+		`<rect width="${doc.w}" height="${doc.h}" style="fill:#fff!important"/>${diagram}<g>${ink}</g></svg>`
+	);
+}
+
+/** Whether omp can render SVG sends (asked once; a failed ask is retried on the next send). */
+let svgSupport = null;
+function canSendSvg() {
+	svgSupport ??= fetch(api("/info"))
+		.then(res => (res.ok ? res.json() : Promise.reject()))
+		.then(info => info.svg === true)
+		.catch(() => {
+			svgSupport = null;
+			return false;
+		});
+	return svgSupport;
+}
+
+async function exportImage() {
+	// A picture is never blown up past its own pixels: that only adds bytes, not detail.
+	const long = bg ? Math.min(EXPORT_LONG_SIDE, Math.max(bg.width, bg.height)) : EXPORT_LONG_SIDE;
+	const k = long / Math.max(doc.w, doc.h);
 	const W = Math.round(doc.w * k);
 	const H = Math.round(doc.h * k);
 	const layer = document.createElement("canvas");
@@ -636,7 +890,14 @@ async function exportPng() {
 	o2d.imageSmoothingQuality = "high";
 	if (bg) o2d.drawImage(bg, 0, 0, W, H);
 	o2d.drawImage(layer, 0, 0);
-	return new Promise((resolve, reject) => out.toBlob(b => (b ? resolve(b) : reject(new Error("PNG export failed"))), "image/png"));
+	const encode = (type, quality) =>
+		new Promise((resolve, reject) => out.toBlob(b => (b ? resolve(b) : reject(new Error("image export failed"))), type, quality));
+	const png = await encode("image/png");
+	// Ink and most diagrams stay well under the budget as PNG (lossless, crisp text). A photo
+	// underneath runs PNG to megabytes, which crawl over a phone link; JPEG is ~10x smaller.
+	if (png.size <= PNG_BUDGET) return png;
+	const jpeg = await encode("image/jpeg", JPEG_QUALITY);
+	return jpeg.size < png.size ? jpeg : png;
 }
 
 function blobToBase64(blob) {
@@ -660,11 +921,17 @@ async function send() {
 	sending = true;
 	updateButtons();
 	try {
-		const data = await blobToBase64(await exportPng());
+		const svg = (await canSendSvg()) ? exportSvg() : null;
+		let payload;
+		if (svg) payload = { svg };
+		else {
+			const image = await exportImage();
+			payload = { data: await blobToBase64(image), mimeType: image.type };
+		}
 		const res = await fetch(api("/send"), {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ data, mimeType: "image/png", note: $("note").value }),
+			body: JSON.stringify({ ...payload, note: $("note").value }),
 		});
 		const body = await res.json().catch(() => ({}));
 		if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);

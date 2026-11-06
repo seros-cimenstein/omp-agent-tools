@@ -10,6 +10,8 @@ export interface Sketch {
 	data: string;
 	mimeType: "image/png" | "image/jpeg";
 	note: string;
+	/** Where the SVG the canvas sent was saved (vector sends; `data` is its rendering). */
+	svgPath?: string;
 }
 
 /** What the canvas page shows about the agent. */
@@ -48,6 +50,11 @@ export interface SketchServer {
 export const PREFERRED_PORT = 7878;
 const MAX_BODY = 32 * 1024 * 1024;
 const MAX_IMAGE_B64 = 24 * 1024 * 1024;
+const MAX_SVG = 8 * 1024 * 1024;
+// The model only takes raster images, so vector sends are rendered here (librsvg).
+const RSVG = Bun.which("rsvg-convert");
+const RENDER_TIMEOUT_MS = 20_000;
+const SVG_DIR = path.join(os.tmpdir(), "omp-sketch");
 const HEARTBEAT_MS = 15_000;
 const VIRTUAL_IFACE = /^(lo|docker|br-|virbr|veth|vmnet|vboxnet|cloudflarewarp|warp|zt|podman|cni|flannel)/i;
 const PHYSICAL_IFACE = /^(wl|en|eth)/i;
@@ -124,15 +131,47 @@ function json(body: unknown, status = 200): Response {
 	});
 }
 
-function parseSketch(body: unknown): Sketch | string {
+/** PNG (base64) of an SVG, rendered by librsvg from stdin: no base file, so it loads nothing external. */
+async function renderSvg(svg: string): Promise<string> {
+	if (!RSVG) throw new Error("SVG sends need rsvg-convert (librsvg) on the PC");
+	const proc = Bun.spawn([RSVG, "--format", "png"], { stdin: new Blob([svg]), stdout: "pipe", stderr: "pipe" });
+	const timer = setTimeout(() => proc.kill(), RENDER_TIMEOUT_MS);
+	try {
+		const [png, err, code] = await Promise.all([
+			new Response(proc.stdout).arrayBuffer(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		if (code !== 0 || png.byteLength === 0) throw new Error(`Couldn't render the SVG: ${err.trim() || `rsvg-convert exited ${code}`}`);
+		return Buffer.from(png).toString("base64");
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function saveSvg(svg: string): string {
+	fs.mkdirSync(SVG_DIR, { recursive: true, mode: 0o700 });
+	const file = path.join(SVG_DIR, `sketch-${Date.now()}.svg`);
+	fs.writeFileSync(file, svg, { mode: 0o600 });
+	return file;
+}
+
+/** A sketch from the page's JSON: a raster `{data, mimeType}` or a vector `{svg}`; a string is the error. */
+async function readSketch(body: unknown): Promise<Sketch | string> {
 	if (!body || typeof body !== "object") return "Body must be a JSON object";
-	const { data, mimeType, note } = body as Record<string, unknown>;
+	const { data, mimeType, svg, note } = body as Record<string, unknown>;
+	if (note !== undefined && typeof note !== "string") return "note must be a string";
+	const text = (note ?? "").trim();
+	if (svg !== undefined) {
+		if (typeof svg !== "string" || !/^<svg[\s>]/.test(svg)) return "svg must be an <svg> document";
+		if (svg.length > MAX_SVG) return "SVG too large";
+		return { data: await renderSvg(svg), mimeType: "image/png", note: text, svgPath: saveSvg(svg) };
+	}
 	if (typeof data !== "string" || data.length === 0) return "Missing image data";
 	if (data.length > MAX_IMAGE_B64) return "Image too large";
 	if (!/^[A-Za-z0-9+/]+=*$/.test(data)) return "Image data must be plain base64";
 	if (mimeType !== "image/png" && mimeType !== "image/jpeg") return "mimeType must be image/png or image/jpeg";
-	if (note !== undefined && typeof note !== "string") return "note must be a string";
-	return { data, mimeType, note: (note ?? "").trim() };
+	return { data, mimeType, note: text };
 }
 
 export function startSketchServer(token: string, hooks: SketchHooks): SketchServer {
@@ -166,7 +205,7 @@ export function startSketchServer(token: string, hooks: SketchHooks): SketchServ
 			});
 		}
 		if (req.method === "GET" && url.pathname === "/info") {
-			return json({ urls: handle.urls, firewallHint: handle.firewallHint, state: hooks.state() });
+			return json({ urls: handle.urls, firewallHint: handle.firewallHint, state: hooks.state(), svg: RSVG !== null });
 		}
 		if (req.method === "GET" && url.pathname === "/diagrams") {
 			return json(hooks.diagrams());
@@ -202,7 +241,12 @@ export function startSketchServer(token: string, hooks: SketchHooks): SketchServ
 			} catch {
 				return json({ error: "Invalid JSON" }, 400);
 			}
-			const sketch = parseSketch(body);
+			let sketch: Sketch | string;
+			try {
+				sketch = await readSketch(body);
+			} catch (err) {
+				return json({ error: err instanceof Error ? err.message : String(err) }, 422);
+			}
 			if (typeof sketch === "string") return json({ error: sketch }, 400);
 			try {
 				return json({ status: hooks.send(sketch) });
