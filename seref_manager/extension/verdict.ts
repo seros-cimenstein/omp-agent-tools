@@ -1,0 +1,153 @@
+/**
+ * Parse and validate the manager model's JSON replies. Anything malformed throws, so the
+ * caller can retry once and then fall back; a partially valid reply is never half-applied.
+ */
+import { isRecord } from "./guards";
+import type { LedgerEdit } from "./ledger";
+
+export interface IterationVerdict {
+	verdict: "continue" | "stuck";
+	reason: string;
+	edits: LedgerEdit[];
+	answers: { question: string; answer: string }[];
+	guidance: string;
+	context: "keep" | "compact" | "reset";
+}
+
+export interface AskQuestion {
+	id: string;
+	question: string;
+	options: { label: string; description?: string }[];
+	multi?: boolean;
+	recommended?: number;
+}
+
+export interface AskAnswer {
+	id: string;
+	question: string;
+	/** Option labels picked, exactly as offered. */
+	selected: string[];
+	custom?: string;
+	why: string;
+}
+
+/** The first balanced top-level JSON object in `text` (tolerates ```json fences and prose around it). */
+export function extractJsonObject(text: string): unknown {
+	const start = text.indexOf("{");
+	if (start === -1) throw new Error("reply has no JSON object");
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let index = start; index < text.length; index++) {
+		const char = text[index];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') inString = true;
+		else if (char === "{") depth++;
+		else if (char === "}" && --depth === 0) return JSON.parse(text.slice(start, index + 1));
+	}
+	throw new Error("reply has an unterminated JSON object");
+}
+
+function stringField(record: Record<string, unknown>, key: string, fallback?: string): string {
+	const value = record[key];
+	if (typeof value === "string") return value.trim();
+	if ((value === undefined || value === null) && fallback !== undefined) return fallback;
+	throw new Error(`"${key}" must be a string`);
+}
+
+function arrayField(record: Record<string, unknown>, key: string): Record<string, unknown>[] {
+	const value = record[key];
+	if (value === undefined || value === null) return [];
+	if (!Array.isArray(value) || !value.every(isRecord)) throw new Error(`"${key}" must be an array of objects`);
+	return value;
+}
+
+export function parseIterationVerdict(text: string): IterationVerdict {
+	const raw = extractJsonObject(text);
+	if (!isRecord(raw)) throw new Error("reply is not a JSON object");
+	const verdict = raw.verdict;
+	if (verdict !== "continue" && verdict !== "stuck") throw new Error(`"verdict" must be "continue" or "stuck"`);
+	const context = raw.context ?? "keep";
+	if (context !== "keep" && context !== "compact" && context !== "reset") {
+		throw new Error(`"context" must be "keep", "compact" or "reset"`);
+	}
+	const edits: LedgerEdit[] = [];
+	for (const [key, kind] of [
+		["reopen", "reopen"],
+		["unblock", "unblock"],
+	] as const) {
+		for (const entry of arrayField(raw, key)) {
+			edits.push({ id: stringField(entry, "id"), kind, reason: stringField(entry, "reason") });
+		}
+	}
+	return {
+		verdict,
+		reason: stringField(raw, "reason", ""),
+		edits,
+		answers: arrayField(raw, "answers").map(entry => ({
+			question: stringField(entry, "question"),
+			answer: stringField(entry, "answer"),
+		})),
+		guidance: stringField(raw, "guidance", ""),
+		context,
+	};
+}
+
+/**
+ * Map the manager's ask reply onto the questions. Labels must match an offered option; a
+ * single-select question takes only the first. The manager always decides: a reply that omits
+ * a question or answers it with nothing usable is an error, so the call is retried.
+ */
+export function parseAskAnswers(text: string, questions: readonly AskQuestion[]): AskAnswer[] {
+	const raw = extractJsonObject(text);
+	if (!isRecord(raw)) throw new Error("reply is not a JSON object");
+	const byId = new Map(arrayField(raw, "answers").map(entry => [entry.id, entry]));
+	return questions.map(question => {
+		const entry = byId.get(question.id);
+		if (!entry) throw new Error(`no answer for question "${question.id}"`);
+		const labels = new Set(question.options.map(option => option.label));
+		const picked = Array.isArray(entry.selected)
+			? entry.selected.filter((label): label is string => typeof label === "string" && labels.has(label))
+			: [];
+		const selected = question.multi === true ? picked : picked.slice(0, 1);
+		const custom = typeof entry.custom === "string" && entry.custom.trim() ? entry.custom.trim() : undefined;
+		if (selected.length === 0 && custom === undefined) throw new Error(`answer for "${question.id}" has no offered option and no custom text`);
+		return { id: question.id, question: question.question, selected, custom, why: typeof entry.why === "string" ? entry.why.trim() : "" };
+	});
+}
+
+const AUDIT_RESULTS = ["holds", "reopen", "unverifiable", "keep", "unblock"] as const;
+export type AuditResult = (typeof AUDIT_RESULTS)[number];
+
+export interface AuditVerdict {
+	checks: { id: string; result: AuditResult; how: string }[];
+	summary: string;
+	/** `reopen`/`unblock` checks as ledger edits; the reason is how the manager found out. */
+	edits: LedgerEdit[];
+}
+
+/**
+ * Parse the manager's audit of items it did not supervise. `holds`/`reopen`/`unverifiable`
+ * judge `[x]` items, `keep`/`unblock` judge `[!]` items; the ledger edit only applies when the
+ * item really is in that state.
+ */
+export function parseAuditVerdict(text: string): AuditVerdict {
+	const raw = extractJsonObject(text);
+	if (!isRecord(raw)) throw new Error("reply is not a JSON object");
+	const checks = arrayField(raw, "checks").map(entry => {
+		const result = AUDIT_RESULTS.find(candidate => candidate === entry.result);
+		if (!result) throw new Error(`"result" must be one of ${AUDIT_RESULTS.join(", ")}`);
+		return { id: stringField(entry, "id"), result, how: stringField(entry, "how", "") };
+	});
+	const edits: LedgerEdit[] = checks.flatMap(check =>
+		check.result === "reopen" || check.result === "unblock"
+			? [{ id: check.id, kind: check.result, reason: check.how || "failed the manager's audit" }]
+			: [],
+	);
+	return { checks, summary: stringField(raw, "summary", ""), edits };
+}
