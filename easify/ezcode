@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Stable 4-character codes for /easify diagram blocks.
+
+  ezcode KEY...       print "#code<TAB>KEY" for each key
+  ezcode --find CODE  print every project path whose code is CODE ("#3fa2" or "3fa2")
+  ezcode --root       print the project root
+
+KEY is a path relative to the project root (folders end with "/"), or any other
+label such as "ext:phone" or "quietmode/quietmode::turn-on".
+Project root: git top-level of the current directory, else the current directory.
+Same key + same root -> same code, in every session.
+"""
+import hashlib
+import os
+import subprocess
+import sys
+
+SKIP_DIRS = {"node_modules", "__pycache__", "build", "dist", "target", "venv"}
+
+
+def code(key):
+    return hashlib.sha1(key.encode()).hexdigest()[:4]
+
+
+def project_root():
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else os.getcwd()
+
+
+def normalize(key, root):
+    if key.startswith("ext:") or "::" in key:
+        return key
+    key = key.removeprefix("./").rstrip("/")
+    return key + "/" if os.path.isdir(os.path.join(root, key)) else key
+
+
+def project_paths(root):
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and (x == ".github" or not x.startswith(".")))
+        rel = os.path.relpath(d, root)
+        prefix = "" if rel == "." else rel + "/"
+        for x in dirs:
+            yield prefix + x + "/"
+        for x in files:
+            yield prefix + x
+
+
+def main(args):
+    root = project_root()
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if args[0] == "--root":
+        print(root)
+        return 0
+    if args[0] == "--find":
+        if len(args) != 2:
+            print("usage: ezcode --find CODE", file=sys.stderr)
+            return 2
+        want = args[1].lstrip("#").lower()
+        hits = [p for p in project_paths(root) if code(p) == want]
+        for p in hits:
+            print(p)
+        return 0 if hits else 1
+    for key in args:
+        key = normalize(key, root)
+        print(f"#{code(key)}\t{key}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
